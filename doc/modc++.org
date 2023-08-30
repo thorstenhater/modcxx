@@ -1,0 +1,104 @@
+#+title: modc++
+
+* [0/4] Fix modcc bugs
+** [ ] hangs on empty RANGE in NEURON
+** [ ] no checking of PARAMETER ranges
+** [ ] cannot have line break in comma separated lists
+** [ ] does not accept var list under THREADSAFE
+
+* Syntax
+** Primitives
+#+begin_src ebnf
+number     ::= [0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?
+identifier ::= [a-zA-Z][a-zA-Z0-9_]*
+comment    ::= [:?] .*\n
+unit       ::= '(' ([^-+/*] | number | identifier)* ')'
+#+end_src
+- Units
+  - seem to be completely ignored by NRN's parser
+  - all tokens are fair game, even undefined ones or worse '}'
+  - we will be stricter, though and only allow sensible tokens
+  - however, newlines in the unit () are fine
+- Identifiers may not start with _ or numbers
+
+** Neuron Block
+#+begin_src ebnf
+neuron     ::= '{' row* '}'
+row        ::= process | ion | global | range | current
+process    ::= kind identifier
+kind       ::= 'POINT_PROCESS' | 'SUFFIX' | 'JUNCTION'
+ion        ::= 'USEION' identifier access
+globacppl     ::= 'GLOBAL' list
+range      ::= 'RANGE' list
+current    ::= 'NONSPECIFIC_CURRENT' list
+access     ::= read? write? valance?
+list       ::= identifier (',' identifier)*
+read       ::= 'READ' list
+write      ::= 'WRITE' list
+valence    ::= 'VALENCE' number
+#+end_src
+
+- line breaks can appear anywhere (or not!)
+- order of statements does not matter
+- we do *not* support (currently)
+  - (BBCORE)POINTER
+  - ELECTRODECURRENT
+  - REPRESENTS
+  - EXTERNAL
+- we do extend
+  - multiple occurences of RANGE, GLOBAL, NONSPECIFIC_CURRENT are allowed and merged
+  - empty READ/WRITE blocks are allowed
+
+** Parameter
+#+begin_src ebnf
+block     ::= 'PARAMETER' '{' parameter* '}'
+parameter ::= identifier assign? range? unit?
+assign    ::= '=' number
+range     ::= '<' number ',' number '>'
+#+end_src
+- newlines *may* occur between parameters and statements, ie 'a \n = 42' is fine
+
+** State
+#+begin_src ebnf
+block     ::= 'STATE' '{' state* '}'
+state ::= identifier assign? range? start? unit?
+range     ::= 'FROM' number TO number
+#+end_src
+- newlines *may* occur in statements
+
+** Procedure (includes INITIAL and other API items)
+#+begin_src ebnf
+procedure  ::= head statements
+head       ::= 'PROCEDURE' identifier
+statements ::= '{' local? list '}'
+list       ::= (statements | statement)*
+local      ::= 'LOCAL' identifier (',' identifier)*
+statement  ::= assign | call
+assign     ::= identifier '=' expression
+#+end_src
+
+* Blocks/Features not implemented in NRN
+(and thus not here as well)
+#+begin_src
+DISCRETE
+FIRST
+FORALL
+LAG name BY name
+MATCH { match, ... }
+PARTIAL name
+~ PRIME = name * DEL2 ( name ) + name
+PLOT list VS name index
+PUTQ name | GETQ name
+RESET
+SECTION list
+SENS list
+STEPPED { body }
+TERMINAL list
+#+end_src
+
+* Blocks/Features not implmented here
+#+begin_src
+CONSTRUCTOR
+DESTRUCTOR
+#+end_src
+- Arrays

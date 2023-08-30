@@ -1,0 +1,18 @@
+#+title: CPS
+
+This converted into CPS
+#+begin_example haskell
+fac n = if n == 0
+        then 1
+        else n * fac (n - 1)
+#+end_example
+becomes
+#+begin_example haskell
+fac n cont = if n == 0
+             then cont 1
+             else fac (n - 1) $ \m -> cont (m*n)
+#+end_example
+
+NB
+- explict control flow
+- primitive (*, /, +, -, ...) do not have a continuation
