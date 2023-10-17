@@ -1,5 +1,5 @@
 use crate::{
-    ast::Module,
+    ast::{Module, KNOWN},
     err::ModcxxError,
     err::Result,
     exp::{Callable, Expression, Operator, Statement, Symbol, Unit, Use},
@@ -59,6 +59,22 @@ pub fn arborize(module: &Module) -> Result<Module> {
             }
         }
     }
+
+    // NEURON doesn't say what to do with PARAMETER, we default to RANGE
+    for param in &module.parameters {
+        if !module.ranges.contains(&param.name)
+         && !module.globals.contains(&param.name)
+         && !KNOWN.iter().any(|v| *v.0 == param.name) {
+            module.ranges.push(param.name.to_string());
+        }
+    }
+
+    for ass in &module.assigned {
+        if !module.ranges.contains(&ass.name) {
+            module.ranges.push(ass.name.to_string());
+        }
+    }
+
 
     // FUNCTION may never write anything globally visible
     for func in module.functions.iter() {
@@ -124,36 +140,14 @@ fn globals_to_arguments(module: &mut Module) {
 /// - Dump all ionic variables from PARAMETER, ASSIGNED, and RANGE
 /// - Remove voltage from ASSIGNED and RANGE
 fn clean_up_assigned(module: &mut Module) {
-    let known = vec![
-        Symbol::parameter(
-            "v",
-            Some(Unit::variable("mV", Location::default())),
-            None,
-            None,
-            Location::default(),
-        ),
-        Symbol::parameter(
-            "celsius",
-            Some(Unit::variable("degC", Location::default())),
-            None,
-            None,
-            Location::default(),
-        ),
-        Symbol::parameter(
-            "area",
-            Some(Unit::variable("um2", Location::default())),
-            None,
-            None,
-            Location::default(),
-        ),
-        Symbol::parameter(
-            "diam",
-            Some(Unit::variable("um", Location::default())),
-            None,
-            None,
-            Location::default(),
-        ),
-    ];
+    let known = KNOWN.iter().map(|(v, u)| Symbol::parameter(
+        v,
+        Some(Unit::variable(u, Location::default())),
+        None,
+        None,
+        Location::default(),
+    ),
+    ).collect::<Vec<_>>();
 
     let mut blacklist = known.clone();
     for ion in &module.ions {

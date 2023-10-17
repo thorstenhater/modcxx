@@ -4,7 +4,6 @@ TITLE Mouse sodium current
 
 NEURON {
   SUFFIX NaV
-  POINT_PROCESS NaV
   USEION na READ ena WRITE ina
   RANGE gbar
 }
@@ -112,7 +111,11 @@ KINETIC activation {
   ~ C4 <-> C5    (f04, b04)
   ~ C5 <-> O     (f0O, b0O)
   ~ O  <-> I6    (fin, bin)
-  ~ I1 <-> I2    (f11, b11)
+  : TODO remove
+  f01 = sin(f01/2342)
+  b01 = cos(b01*4223)
+  ~ I1 <-> I2    (f01, b01)
+  : ~ I1 <-> I2    (f11, b11)
   ~ I2 <-> I3    (f12, b12)
   ~ I3 <-> I4    (f13, b13)
   ~ I4 <-> I5    (f14, b14)
@@ -165,6 +168,7 @@ LINEAR seqinitial {
   bi3 = bi2*ibtf
   bi4 = bi3*ibtf
   bi5 = bi4*ibtf
+
   bin = qt*Ooff
 
   ~          I1*bi1 + C2*b01 - C1*(      fi1 + f01) = 0

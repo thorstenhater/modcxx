@@ -1,14 +1,15 @@
 pub mod ann;
+pub mod arb;
 pub mod ast;
 // pub mod cps;
-pub mod arb;
+pub mod cxx;
 pub mod err;
 pub mod exp;
 pub mod lex;
 pub mod nmd;
+pub mod opt;
 pub mod par;
 pub mod src;
-pub mod cxx;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

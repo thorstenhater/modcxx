@@ -16,6 +16,8 @@ pub enum ModcxxError {
     MissingKind,
     #[error("Cannot arborize NMODL: feature {0} is not supported in Arbor.")]
     ArborUnsupported(String),
+    #[error("Statement misplaced: found a {0}-type statement in a {1}-type block here {2:?}.")]
+    StatementUnsupported(String, String, Location),
     #[error("Cannot create module; feature {0} is not supported in Arbor.\n{1}")]
     Unsupported(String, String),
     #[error("Duplicate symbol {0} in {1:?}, first defined here {2:?}.")]
@@ -35,7 +37,19 @@ pub enum ModcxxError {
     #[error("Symbol {0} is callable, used as a variable here {1:?}.")]
     CallableNotVariable(String, Location),
     #[error("Symbol {0} is variable, used as a callable here {1:?}.")]
+    CallableNotSolvable(String, Location),
+    #[error("Symbol {0} is callable, used in SOLVE here {1:?}.")]
     VariableNotCallable(String, Location),
+    #[error("Symbol {0} is solvable, used as a variable here {1:?}.")]
+    SolvableNotVariable(String, Location),
+    #[error("Symbol {0} is solvable, used as a callable here {1:?}.")]
+    SolvableNotCallable(String, Location),
+    #[error("ASSIGNED {0} may be used unintialised in block {1}.")]
+    UninitialisedAssigned(String, String),
+    #[error("Function/Procedure {0} expects {1} arguments, given {2} here {3:?}.")]
+    WrongArity(String, usize, usize, Location),
+    #[error("KINETIC block switched from reaction (~ A <-> B ...) to a normal statement here {0:?}. This is likely illformed and not what you intend.")]
+    IntermingledReactionNormal(Location),
     #[error("Internal Error {0}.")]
     InternalError(String),
 }

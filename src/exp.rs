@@ -151,7 +151,7 @@ impl Block {
         res
     }
 
-    pub fn use_timeline(&self) -> Map<String, Vec<Use>> {
+    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
         let mut res: Map<_, Vec<_>> = Map::new();
         let locals = self
             .locals
@@ -204,6 +204,14 @@ impl Block {
         }
         Ok(Block::block(&locals, &stmnts, self.loc))
     }
+
+    fn substitute(&self, from: &ExpressionT, to: &ExpressionT) -> Result<Self> {
+        let mut res = self.clone();
+        for stmnt in res.stmnts.iter_mut() {
+            *stmnt = stmnt.substitute(from, to)?;
+        }
+        Ok(res)
+    }
 }
 
 pub type Statement = WithLocation<StatementT>;
@@ -213,8 +221,8 @@ pub enum Use {
     R,
     W,
     Solve,
-    CallP,
-    CallF,
+    CallP(usize),
+    CallF(usize),
     Unknown, // Might be anything... can happen if we cross an if with different usage
 }
 
@@ -231,8 +239,18 @@ impl Statement {
         Statement::new(StatementT::Conserve(lhs, rhs), loc)
     }
 
-    pub fn rate(from: String, to: String, fwd: Expression, bwd: Expression, loc: Location) -> Self {
+    pub fn rate(
+        from: Expression,
+        to: Expression,
+        fwd: Expression,
+        bwd: Expression,
+        loc: Location,
+    ) -> Self {
         Statement::new(StatementT::Rate(from, to, fwd, bwd), loc)
+    }
+
+    pub fn linear(lhs: Expression, rhs: Expression, loc: Location) -> Self {
+        Statement::new(StatementT::Linear(lhs, rhs), loc)
     }
 
     pub fn derivative(lhs: &str, rhs: Expression, loc: Location) -> Self {
@@ -257,8 +275,8 @@ impl Statement {
         )
     }
 
-    pub fn if_then_else(i: Expression, t: Statement, e: Option<Statement>, loc: Location) -> Self {
-        Statement::new(StatementT::IfThenElse(i, Box::new(t), e.map(Box::new)), loc)
+    pub fn if_then_else(i: Expression, t: Block, e: Option<Block>, loc: Location) -> Self {
+        Statement::new(StatementT::IfThenElse(i, t, e), loc)
     }
 
     pub fn block(block: Block) -> Self {
@@ -270,15 +288,26 @@ impl Statement {
     }
 
     pub fn uses(&self) -> Map<String, Set<Use>> {
-        let mut res = Map::new();
+        let mut res: Map<String, Set<Use>> = Map::new();
         match &self.data {
+            StatementT::Linear(lhs, rhs) => {
+                for v in lhs
+                    .variables()
+                    .into_iter()
+                    .chain(rhs.variables().into_iter())
+                {
+                    res.entry(v.to_string())
+                        .or_default()
+                        .extend(&[Use::R, Use::W]);
+                }
+            }
             StatementT::Assign(lhs, rhs) => {
-                res.entry(lhs.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::W);
                 for (k, mut us) in rhs.uses() {
                     res.entry(k.to_string()).or_default().append(&mut us);
                 }
+                res.entry(lhs.to_string())
+                    .or_insert_with(Set::new)
+                    .insert(Use::W);
             }
             StatementT::Return(rhs) => {
                 for (k, mut us) in rhs.uses() {
@@ -288,13 +317,11 @@ impl Statement {
             StatementT::Call(call) => {
                 if let ExpressionT::Call(fun, args) = &call.data {
                     res.entry(fun.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::CallP);
+                        .or_default()
+                        .insert(Use::CallP(args.len()));
                     for arg in args {
                         for var in arg.variables() {
-                            res.entry(var.to_string())
-                                .or_insert_with(Set::new)
-                                .insert(Use::R);
+                            res.entry(var.to_string()).or_default().insert(Use::R);
                         }
                     }
                 }
@@ -314,64 +341,40 @@ impl Statement {
             }
             StatementT::Conserve(l, r) => {
                 for var in l.variables() {
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::R);
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::W);
+                    res.entry(var.to_string()).or_default().insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::W);
                 }
                 for var in r.variables() {
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::R);
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::W);
+                    res.entry(var.to_string()).or_default().insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::W);
                 }
             }
             StatementT::Rate(l, r, f, b) => {
-                res.entry(l.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::R);
-                res.entry(l.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::W);
-                res.entry(r.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::R);
-                res.entry(r.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::W);
+                for var in l.variables() {
+                    res.entry(var.to_string()).or_default().insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::W);
+                }
+                for var in r.variables() {
+                    res.entry(var.to_string()).or_default().insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::W);
+                }
                 for var in f.variables() {
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::R);
                 }
                 for var in b.variables() {
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::R);
                 }
             }
             StatementT::Derivative(nm, ex) => {
-                res.entry(format!("{nm}'"))
-                    .or_insert_with(Set::new)
-                    .insert(Use::R);
-                res.entry(format!("{nm}'"))
-                    .or_insert_with(Set::new)
-                    .insert(Use::W);
+                res.entry(format!("{nm}'")).or_default().insert(Use::R);
+                res.entry(format!("{nm}'")).or_default().insert(Use::W);
                 for var in ex.variables() {
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::R);
                 }
             }
             StatementT::IfThenElse(c, t, e) => {
                 for var in c.variables() {
-                    res.entry(var.to_string())
-                        .or_insert_with(Set::new)
-                        .insert(Use::R);
+                    res.entry(var.to_string()).or_default().insert(Use::R);
                 }
                 res.append(&mut t.uses());
                 if let Some(o) = e {
@@ -379,22 +382,33 @@ impl Statement {
                 }
             }
             StatementT::Solve(blk, _) => {
-                res.entry(blk.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::Solve);
+                res.entry(blk.to_string()).or_default().insert(Use::Solve);
             }
         }
         res
     }
 
-    pub fn use_timeline(&self) -> Map<String, Vec<Use>> {
+    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
         let mut res: Map<_, Vec<_>> = Map::new();
         match &self.data {
+            StatementT::Linear(lhs, rhs) => {
+                for v in lhs
+                    .variables()
+                    .into_iter()
+                    .chain(rhs.variables().into_iter())
+                {
+                    res.entry(v.to_string())
+                        .or_default()
+                        .extend([(Use::R, self.loc), (Use::W, self.loc)]);
+                }
+            }
             StatementT::Assign(lhs, rhs) => {
-                res.entry(lhs.to_string()).or_default().push(Use::W);
                 for (k, mut us) in rhs.use_timeline() {
                     res.entry(k.to_string()).or_default().append(&mut us);
                 }
+                res.entry(lhs.to_string())
+                    .or_default()
+                    .push((Use::W, self.loc));
             }
             StatementT::Return(rhs) => {
                 for (k, mut us) in rhs.use_timeline() {
@@ -403,10 +417,14 @@ impl Statement {
             }
             StatementT::Call(call) => {
                 if let ExpressionT::Call(fun, args) = &call.data {
-                    res.entry(fun.to_string()).or_default().push(Use::CallP);
+                    res.entry(fun.to_string())
+                        .or_default()
+                        .push((Use::CallP(args.len()), self.loc));
                     for arg in args {
                         for var in arg.variables() {
-                            res.entry(var.to_string()).or_default().push(Use::R);
+                            res.entry(var.to_string())
+                                .or_default()
+                                .push((Use::R, self.loc));
                         }
                     }
                 }
@@ -426,36 +444,68 @@ impl Statement {
             }
             StatementT::Conserve(l, r) => {
                 for var in l.variables() {
-                    res.entry(var.to_string()).or_default().push(Use::R);
-                    res.entry(var.to_string()).or_default().push(Use::W);
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::W, self.loc));
                 }
                 for var in r.variables() {
-                    res.entry(var.to_string()).or_default().push(Use::R);
-                    res.entry(var.to_string()).or_default().push(Use::W);
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::W, self.loc));
                 }
             }
             StatementT::Rate(l, r, f, b) => {
-                res.entry(l.to_string()).or_default().push(Use::R);
-                res.entry(l.to_string()).or_default().push(Use::W);
-                res.entry(r.to_string()).or_default().push(Use::R);
-                res.entry(r.to_string()).or_default().push(Use::W);
+                for var in l.variables() {
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::W, self.loc));
+                }
+                for var in r.variables() {
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::W, self.loc));
+                }
                 for var in f.variables() {
-                    res.entry(var.to_string()).or_default().push(Use::R);
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
                 }
                 for var in b.variables() {
-                    res.entry(var.to_string()).or_default().push(Use::R);
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
                 }
             }
             StatementT::Derivative(nm, ex) => {
-                res.entry(format!("{nm}'")).or_default().push(Use::R);
-                res.entry(format!("{nm}'")).or_default().push(Use::W);
+                res.entry(format!("{nm}'"))
+                    .or_default()
+                    .push((Use::R, self.loc));
+                res.entry(format!("{nm}'"))
+                    .or_default()
+                    .push((Use::W, self.loc));
                 for var in ex.variables() {
-                    res.entry(var.to_string()).or_default().push(Use::R);
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
                 }
             }
             StatementT::IfThenElse(c, t, e) => {
                 for var in c.variables() {
-                    res.entry(var.to_string()).or_default().push(Use::R);
+                    res.entry(var.to_string())
+                        .or_default()
+                        .push((Use::R, self.loc));
                 }
                 let ls = t.use_timeline();
                 let rs = if let Some(o) = e {
@@ -472,12 +522,14 @@ impl Statement {
                     if l == r {
                         res.entry(k).or_default().append(&mut l);
                     } else {
-                        res.entry(k).or_default().push(Use::Unknown);
+                        res.entry(k).or_default().push((Use::Unknown, self.loc));
                     }
                 }
             }
             StatementT::Solve(blk, _) => {
-                res.entry(blk.to_string()).or_default().push(Use::Solve);
+                res.entry(blk.to_string())
+                    .or_default()
+                    .push((Use::Solve, self.loc));
             }
         }
         res
@@ -486,6 +538,10 @@ impl Statement {
     pub fn substitute(&self, from: &ExpressionT, to: &ExpressionT) -> Result<Self> {
         let mut res = self.clone();
         match res.data {
+            StatementT::Linear(ref mut lhs, ref mut rhs) => {
+                *lhs = lhs.substitute(from, to)?;
+                *rhs = rhs.substitute(from, to)?;
+            }
             StatementT::Assign(ref mut lhs, ref mut rhs) => {
                 if let ExpressionT::Variable(x) = &to {
                     if let ExpressionT::Variable(y) = &from {
@@ -499,14 +555,7 @@ impl Statement {
             StatementT::Return(ref mut rhs) => {
                 *rhs = rhs.substitute(from, to)?;
             }
-            StatementT::Block(Block {
-                data: BlockT { ref mut stmnts, .. },
-                ..
-            }) => {
-                for stmnt in stmnts.iter_mut() {
-                    *stmnt = stmnt.substitute(from, to)?;
-                }
-            }
+            StatementT::Block(ref mut blk) => *blk = blk.substitute(from, to)?,
             StatementT::Call(ref mut ex) => {
                 *ex = ex.substitute(from, to)?;
             }
@@ -519,25 +568,17 @@ impl Statement {
             }
             StatementT::IfThenElse(ref mut c, ref mut t, ref mut e) => {
                 *c = c.substitute(from, to)?;
-                *t = Box::new(t.substitute(from, to)?);
+                *t = t.substitute(from, to)?;
                 if let Some(ref mut i) = e {
-                    *i = Box::new(i.substitute(from, to)?)
+                    *i = i.substitute(from, to)?;
                 }
             }
             StatementT::Initial(_) => {
                 unimplemented!()
             }
             StatementT::Rate(ref mut f, ref mut t, ref mut fwd, ref mut bwd) => {
-                if let ExpressionT::Variable(x) = &to {
-                    if let ExpressionT::Variable(y) = &from {
-                        if f == y {
-                            *f = x.to_string();
-                        }
-                        if t == y {
-                            *t = x.to_string();
-                        }
-                    }
-                }
+                *f = f.substitute(from, to)?;
+                *t = t.substitute(from, to)?;
                 *fwd = fwd.substitute(from, to)?;
                 *bwd = bwd.substitute(from, to)?;
             }
@@ -569,9 +610,10 @@ pub enum StatementT {
     Return(Expression),
     Solve(String, Solver),
     Conserve(Expression, Expression),
-    Rate(String, String, Expression, Expression),
+    Rate(Expression, Expression, Expression, Expression),
+    Linear(Expression, Expression),
     Derivative(String, Expression),
-    IfThenElse(Expression, Box<Statement>, Option<Box<Statement>>),
+    IfThenElse(Expression, Block, Option<Block>),
     Block(Block),
     Call(Expression), // This feels redundant
     Initial(Block),   // This is _only_ ever for NET_RECEIVE... I hate NMODL
@@ -586,6 +628,31 @@ impl Expression {
 
     pub fn binary(lhs: Expression, op: Operator, rhs: Expression, loc: Location) -> Self {
         Expression::new(ExpressionT::Binary(Box::new(lhs), op, Box::new(rhs)), loc)
+    }
+
+    pub fn mul(lhs: Expression, rhs: Expression, loc: Location) -> Self {
+        Expression::new(
+            ExpressionT::Binary(Box::new(lhs), Operator::Mul, Box::new(rhs)),
+            loc,
+        )
+    }
+
+    pub fn neg(rhs: Expression, loc: Location) -> Self {
+        Expression::new(ExpressionT::Unary(Operator::Neg, Box::new(rhs)), loc)
+    }
+
+    pub fn pow(lhs: Expression, rhs: Expression, loc: Location) -> Self {
+        Expression::new(
+            ExpressionT::Binary(Box::new(lhs), Operator::Pow, Box::new(rhs)),
+            loc,
+        )
+    }
+
+    pub fn add(lhs: Expression, rhs: Expression, loc: Location) -> Self {
+        Expression::new(
+            ExpressionT::Binary(Box::new(lhs), Operator::Add, Box::new(rhs)),
+            loc,
+        )
     }
 
     pub fn number(var: &str, loc: Location) -> Self {
@@ -628,46 +695,53 @@ impl Expression {
         res
     }
 
-    fn guses<T>(&self, on: &mut dyn FnMut(&mut T, Use)) -> Map<String, T>
+    fn guses<T>(&self, on: &mut dyn FnMut(&mut T, Use, Location)) -> Map<String, T>
     where
         T: Default,
     {
-        fn uses_<T>(ex: &ExpressionT, res: &mut Map<String, T>, on: &mut dyn FnMut(&mut T, Use))
-        where
+        fn uses_<T>(
+            ex: &Expression,
+            res: &mut Map<String, T>,
+            on: &mut dyn FnMut(&mut T, Use, Location),
+        ) where
             T: Default,
         {
-            match &ex {
+            match &ex.data {
                 ExpressionT::Variable(v) => {
-                    on(res.entry(v.to_string()).or_default(), Use::R);
+                    on(res.entry(v.to_string()).or_default(), Use::R, ex.loc);
                 }
                 ExpressionT::String(_) | ExpressionT::Number(_) => {}
-                ExpressionT::Unary(_, e) => uses_(&e.data, res, on),
+                ExpressionT::Unary(_, e) => uses_(&e, res, on),
                 ExpressionT::Binary(l, _, r) => {
-                    uses_(&l.data, res, on);
-                    uses_(&r.data, res, on);
+                    uses_(&l, res, on);
+                    uses_(&r, res, on);
                 }
                 ExpressionT::Call(f, es) => {
-                    on(res.entry(f.to_string()).or_default(), Use::CallF);
+                    on(
+                        res.entry(f.to_string()).or_default(),
+                        Use::CallF(es.len()),
+                        ex.loc,
+                    );
                     for e in es {
-                        uses_(&e.data, res, on);
+                        uses_(&e, res, on);
                     }
                 }
             }
         }
         let mut res = Map::new();
-        uses_(&self.data, &mut res, on);
+        uses_(&self, &mut res, on);
         res
     }
 
     pub fn uses(&self) -> Map<String, Set<Use>> {
-        self.guses(&mut |set, us| {
+        self.guses(&mut |set, us, _| {
             set.insert(us);
         })
     }
 
-    pub fn use_timeline(&self) -> Map<String, Vec<Use>> {
-        self.guses(&mut |set, us| {
-            set.push(us);
+    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
+        self.guses(&mut |set, us, loc| {
+            set.push((us, loc));
         })
     }
 
@@ -881,6 +955,19 @@ impl Callable {
 
     pub fn uses(&self) -> Map<String, Set<Use>> {
         let mut res = self.body.uses();
+        res.retain(|k, _| {
+            !self
+                .args
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|a| &a.name == k)
+        });
+        res
+    }
+
+    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
+        let mut res = self.body.use_timeline();
         res.retain(|k, _| {
             !self
                 .args

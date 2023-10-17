@@ -67,6 +67,10 @@ pub fn to_nmodl(module: &Module) -> Result<String> {
         res.push(kinetic(proc)?);
     }
 
+    for proc in &module.linears {
+        res.push(linear(proc)?);
+    }
+
     if let Some(proc) = &module.net_receive {
         res.push(net_receive(proc)?);
     }
@@ -251,6 +255,19 @@ fn assigned(assign: &[Symbol]) -> Result<String> {
     Ok(res.join("\n"))
 }
 
+fn precedence_of(out: Operator) -> usize {
+    use Operator::*;
+    match out {
+        Nil => 0,
+        And | Or => 10,
+        Not | LT | GT | GE | LE | Eq | NEq => 20,
+        Add | Sub => 30,
+        Neg | Mul | Div => 40,
+        Pow => 50,
+        _ => todo!()
+    }
+}
+
 fn expression(ex: &Expression) -> Result<String> {
     expression_with_precedence(ex, Operator::Nil)
 }
@@ -258,7 +275,7 @@ fn expression(ex: &Expression) -> Result<String> {
 fn expression_with_precedence(ex: &Expression, out: Operator) -> Result<String> {
     let res = match &ex.data {
         ExpressionT::Variable(v) => v.to_string(),
-        ExpressionT::Binary(l, o, r) if *o < out => format!(
+        ExpressionT::Binary(l, o, r) if precedence_of(*o) < precedence_of(out) => format!(
             "({} {o} {})",
             expression_with_precedence(l, *o)?,
             expression_with_precedence(r, *o)?
@@ -285,6 +302,12 @@ fn expression_with_precedence(ex: &Expression, out: Operator) -> Result<String> 
 fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String> {
     let mut res = Vec::new();
     match &stmnt.data {
+        StatementT::Linear(lhs, rhs) => res.push(format!(
+            "{:ind$}~ {} = {}",
+            "",
+            expression(lhs)?,
+            expression(rhs)?
+        )),
         StatementT::Assign(lhs, rhs) => {
             res.push(format!("{:ind$}{lhs} = {}", "", expression(rhs)?))
         }
@@ -325,23 +348,24 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
         StatementT::Rate(l, r, f, b) => res.push(format!(
             "{:ind$} ~ {} <-> {} ({}, {})",
             "",
-            l,
-            r,
+            expression(l)?,
+            expression(r)?,
             expression(f)?,
             expression(b)?
         )),
+
         StatementT::IfThenElse(c, ts, es) => {
             res.push(format!(
                 "{:ind$}if ({}) {}",
                 "",
                 expression(c)?,
-                statement(ts, ind, func)?.trim_start()
+                block(ts, ind, func)?.trim_start()
             ));
             if let Some(es) = es {
                 res.push(format!(
                     "{:ind$}else {}",
                     "",
-                    statement(es, ind, func)?.trim_start()
+                    block(es, ind, func)?.trim_start()
                 ));
             }
         }
@@ -482,6 +506,14 @@ fn derivative(proc: &Callable) -> Result<String> {
 fn kinetic(proc: &Callable) -> Result<String> {
     Ok(format!(
         "KINETIC {} {}",
+        proc.name,
+        block(&proc.body, 0, None)?
+    ))
+}
+
+fn linear(proc: &Callable) -> Result<String> {
+    Ok(format!(
+        "LINEAR {} {}",
         proc.name,
         block(&proc.body, 0, None)?
     ))

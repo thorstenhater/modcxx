@@ -3,8 +3,8 @@ use crate::lex::{Lexer, Token, Type};
 use crate::src::{Code, Location};
 
 use crate::exp::{
-    Block, Callable, Expression, Independent, Operator, Statement, StatementT, Symbol, Unit,
-    Variable,
+    Block, Callable, Expression, ExpressionT, Independent, Operator, Statement, StatementT, Symbol,
+    Unit, Variable,
 };
 
 use crate::Set;
@@ -23,6 +23,7 @@ pub struct Module {
     pub units: Vec<(Unit, Unit)>,
     pub procedures: Vec<Callable>,
     pub kinetics: Vec<Callable>,
+    pub linears: Vec<Callable>,
     pub functions: Vec<Callable>,
     pub independents: Vec<Independent>,
     pub constants: Vec<Symbol>,
@@ -403,6 +404,7 @@ impl Parser {
                 }
                 Initial => result.initial.push(self.initial()?),
                 Kinetic => result.kinetics.push(self.kinetic()?),
+                Linear => result.linears.push(self.linear()?),
                 Constant => result.constants.append(&mut self.constants()?),
                 Destructor => {
                     let tok = self.expect(Destructor)?;
@@ -467,6 +469,13 @@ impl Parser {
         Ok(Callable::headless(&id.val.unwrap(), body, ds.loc))
     }
 
+    fn linear(&mut self) -> Result<Callable> {
+        let ds = self.expect(Type::Linear)?;
+        let id = self.expect(Type::Identifier)?;
+        let body = self.block()?;
+        Ok(Callable::headless(&id.val.unwrap(), body, ds.loc))
+    }
+
     fn derivative(&mut self) -> Result<Callable> {
         let ds = self.expect(Type::Derivative)?;
         let id = self.expect(Type::Identifier)?;
@@ -524,9 +533,9 @@ impl Parser {
                     stmnt.data = StatementT::Return(rhs.clone());
                 }
                 StatementT::IfThenElse(_, t, e) => {
-                    patch_stmnt(t, name);
+                    patch_block(t, name);
                     if let Some(ref mut e) = e {
-                        patch_stmnt(e, name);
+                        patch_block(e, name);
                     }
                 }
                 StatementT::Block(ref mut blk) => patch_block(blk, name),
@@ -626,19 +635,16 @@ impl Parser {
                 let then = self.block()?;
                 let neht = if self.matches(Else).is_some() {
                     if self.lexer.peek().typ == If {
-                        Some(self.statement()?)
+                        let nested = self.statement()?;
+                        let loc = nested.loc;
+                        Some(Block::block(&[], &[nested], loc))
                     } else {
-                        Some(Statement::block(self.block()?))
+                        Some(self.block()?)
                     }
                 } else {
                     None
                 };
-                Ok(Statement::if_then_else(
-                    cond,
-                    Statement::block(then),
-                    neht,
-                    loc,
-                ))
+                Ok(Statement::if_then_else(cond, then, neht, loc))
             }
             Solve => {
                 let loc = self.expect(Solve)?.loc;
@@ -689,21 +695,42 @@ impl Parser {
             }
             Tilde => {
                 let loc = self.expect(Tilde)?.loc;
-                let from = self.expect(Identifier)?;
-                self.expect(LRArrow)?;
-                let to = self.expect(Identifier)?;
-                self.expect(LeftParen)?;
-                let fwd = self.expression()?;
-                self.expect(Comma)?;
-                let bwd = self.expression()?;
-                self.expect(RightParen)?;
-                Ok(Statement::rate(
-                    from.val.unwrap(),
-                    to.val.unwrap(),
-                    fwd,
-                    bwd,
-                    loc,
-                ))
+                let from = self.expression()?;
+                match self.lexer.peek().typ {
+                    LRArrow => {
+                        self.expect(LRArrow)?;
+                        // Nasty: If the next bit is foo (a, b) we parse it erroneously
+                        // as a call...
+                        let rest = self.expression()?;
+                        if self.lexer.peek().typ == LeftParen {
+                            // We did not fall for this trap... so our `to` is `rest`
+                            self.expect(LeftParen)?;
+                            let fwd = self.expression()?;
+                            self.expect(Comma)?;
+                            let bwd = self.expression()?;
+                            self.expect(RightParen)?;
+                            Ok(Statement::rate(from, rest, fwd, bwd, loc))
+                        } else {
+                            // We did fall for it... Oh my, now we take `rest` apart...
+                            if let ExpressionT::Call(nm, args) = rest.data {
+                                let to = Expression::variable(&nm, rest.loc);
+                                if let [fwd, bwd] = &args[..] {
+                                    Ok(Statement::rate(from, to, fwd.clone(), bwd.clone(), loc))
+                                } else {
+                                    panic!()
+                                }
+                            } else {
+                                panic!()
+                            }
+                        }
+                    }
+                    Assign => {
+                        self.expect(Assign)?;
+                        let rhs = self.expression()?;
+                        Ok(Statement::linear(from, rhs, loc))
+                    }
+                    _ => Err(self.unexpected_token(&[LRArrow, Eq])),
+                }
             }
             Initial => {
                 let loc = self.expect(Initial)?.loc;

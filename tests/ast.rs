@@ -2,8 +2,7 @@ use modcxx;
 
 #[test]
 fn test_scope() {
-    let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
 }
@@ -18,8 +17,7 @@ FUNCTION foo(x, y) {
     let new = modcxx::ast::Module::new(&raw);
     eprintln!("{new:?}");
     assert!(matches!(new, Err(modcxx::err::ModcxxError::UnboundName(s, _)) if s == "z"));
-    let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
   RANGE baz
@@ -37,8 +35,7 @@ PROCEDURE foo(x, y) {
     let new = modcxx::ast::Module::new(&raw);
     assert!(matches!(new, Err(modcxx::err::ModcxxError::UnboundName(s, _)) if s == "z"));
 
-    let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
   RANGE baz
@@ -58,8 +55,7 @@ PROCEDURE foo(x, y) {
     eprintln!("{new:?}");
     assert!(new.is_ok());
 
-    let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
   RANGE baz
@@ -82,8 +78,7 @@ PROCEDURE foo(x, y) {
 
 #[test]
 fn test_access() {
-    let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
 }
@@ -97,8 +92,7 @@ BREAKPOINT { baz = 42 }
     let new = modcxx::ast::Module::new(&raw);
     assert!(matches!(new, Err(modcxx::err::ModcxxError::WriteToRO(s, _)) if s == "baz"));
 
-let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
 }
@@ -112,8 +106,7 @@ BREAKPOINT { baz = 42 }
     let new = modcxx::ast::Module::new(&raw);
     assert!(matches!(new, Err(modcxx::err::ModcxxError::CallableNotVariable(s, _)) if s == "baz"));
 
-let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
 }
@@ -130,8 +123,7 @@ baz(23)}
     // TODO Busted as LOCALs are not considered by `use`
     //assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
 
-let src =
-r#"
+    let src = r#"
 NEURON {
   SUFFIX foobar
 }
@@ -147,5 +139,4 @@ baz(23)}
     let new = modcxx::ast::Module::new(&raw);
     eprintln!("{new:?}");
     assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
-
 }

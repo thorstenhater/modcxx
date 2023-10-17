@@ -1,7 +1,7 @@
 use crate::{
-    exp::{Callable, Unit, Symbol, Block, Statement, Expression, Operator},
     ast::Module,
     err::Result,
+    exp::{Block, Callable, Expression, Operator, Statement, Symbol, Unit},
 };
 
 trait ToCxxDef {
@@ -27,6 +27,7 @@ impl ToCxxDef for Statement {
             crate::exp::StatementT::Block(_) => todo!(),
             crate::exp::StatementT::Call(_) => todo!(),
             crate::exp::StatementT::Initial(_) => todo!(),
+            crate::exp::StatementT::Linear(_, _) => todo!(),
         }
     }
 }
@@ -41,13 +42,18 @@ impl ToCxxDef for Expression {
     fn def(&self, ind: usize) -> String {
         match &self.data {
             crate::exp::ExpressionT::Unary(o, e) => format!("{:ind$}{}{}", "", o.def(0), e.def(0)),
-            crate::exp::ExpressionT::Binary(l, o, r) => format!("{:ind$}{} {} {}", "", l.def(0), o.def(0), r.def(0)),
+            crate::exp::ExpressionT::Binary(l, o, r) => {
+                format!("{:ind$}{} {} {}", "", l.def(0), o.def(0), r.def(0))
+            }
             crate::exp::ExpressionT::Variable(n) => format!("{:ind$}{n}", ""),
             crate::exp::ExpressionT::Number(n) => format!("{:ind$}{n}", ""),
             crate::exp::ExpressionT::String(n) => format!("{:ind$}\"{n}\"", ""),
-            crate::exp::ExpressionT::Call(f, a) => format!("{:ind$}{}({})", "",
-                                                           f,
-                                                           a.iter().map(|a| a.def(0)).collect::<Vec<_>>().join(", ")),
+            crate::exp::ExpressionT::Call(f, a) => format!(
+                "{:ind$}{}({})",
+                "",
+                f,
+                a.iter().map(|a| a.def(0)).collect::<Vec<_>>().join(", ")
+            ),
         }
     }
 }
@@ -61,7 +67,6 @@ impl ToCxxDef for Block {
         }
         for stmnt in &self.stmnts {
             res.push(stmnt.def(ind + 4));
-
         }
         res.push(String::from("}"));
         res.join("\n")
@@ -71,17 +76,22 @@ impl ToCxxDef for Block {
 impl ToCxxDef for Callable {
     fn def(&self, ind: usize) -> String {
         let args = if let Some(args) = &self.args {
-            args.iter().map(|s| s.decl(ind)).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|s| s.decl(ind))
+                .collect::<Vec<_>>()
+                .join(", ")
         } else {
             String::new()
         };
 
-        format!("{:ind$}{} {}({}) {}",
-                "",
-                &self.unit.decl(ind),
-                &self.name,
-                args,
-                self.body.def(ind))
+        format!(
+            "{:ind$}{} {}({}) {}",
+            "",
+            &self.unit.decl(ind),
+            &self.name,
+            args,
+            self.body.def(ind)
+        )
     }
 }
 
@@ -111,7 +121,6 @@ impl ToCxxDef for Module {
         for fun in &self.procedures {
             res.push(fun.def(ind));
         }
-
 
         res.join("\n\n")
     }
@@ -146,15 +155,15 @@ impl ToCxxDecl for Symbol {
 impl ToCxxDecl for Callable {
     fn decl(&self, ind: usize) -> String {
         let args = if let Some(args) = &self.args {
-            args.iter().map(|s| s.decl(ind)).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|s| s.decl(ind))
+                .collect::<Vec<_>>()
+                .join(", ")
         } else {
             String::new()
         };
 
-        format!("{} {}({});",
-                "void",
-                &self.name,
-                args)
+        format!("{} {}({});", "void", &self.name, args)
     }
 }
 

@@ -1,10 +1,14 @@
 use crate::{
     err::{ModcxxError, Result},
     exp::{
-        Access, Block, Callable, Expression, ExpressionT, Statement, StatementT, Symbol, Unit, Use, Variable,
+        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol,
+        Unit, Use,
     },
+    lex::KEYWORDS,
+    opt::Simplify,
     par::{self, Ion, Kind},
-    Map, Set, lex::KEYWORDS, src::Location,
+    src::Location,
+    Map, Set,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,10 +30,18 @@ pub struct Module {
     pub units: Vec<(Unit, Unit)>,
     pub procedures: Vec<Callable>,
     pub kinetics: Vec<Callable>,
+    pub linears: Vec<Callable>,
     pub functions: Vec<Callable>,
     pub constants: Vec<Symbol>,
     pub net_receive: Option<Callable>,
 }
+
+pub const FUNCTIONS: [(&'static str, usize); 1] = [("exp", 1)];
+pub const KNOWN: [(&'static str, &'static str); 4] = [("celsius", "degC"),
+                                                      ("v", "mV"),
+                                                      ("area", "um2"),
+                                                      ("diam", "um"),];
+
 
 impl Module {
     pub fn new(module: &par::Module) -> Result<Self> {
@@ -128,6 +140,15 @@ impl Module {
             }
         };
 
+        for var in &module.assigned {
+            let nm = &var.name;
+            eprintln!("ASSIGNED {nm}");
+            if !ranges.contains(nm) && !globals.contains(nm) && !KNOWN.iter().any(|p| p.0 == nm) {
+                eprintln!("++ ASSIGNED {nm}");
+                ranges.push(nm.to_string());
+            }
+        }
+
         let derivatives = module.derivatives.clone();
         let assigned = module.assigned.clone();
         let units = module.units.clone();
@@ -136,27 +157,31 @@ impl Module {
         let procedures = module.procedures.clone();
         let parameters = module.parameters.clone();
         let kinetics = module.kinetics.clone();
+        let linears = module.linears.clone();
 
-        let res = Module { title,
-                           name,
-                           kind,
-                           non_specific_currents,
-                           ranges,
-                           globals,
-                           ions,
-                           description,
-                           initial,
-                           breakpoint,
-                           derivatives,
-                           states,
-                           assigned,
-                           units,
-                           constants,
-                           functions,
-                           procedures,
-                           parameters,
-                           kinetics,
-                           net_receive, };
+        let res = Module {
+            title,
+            name,
+            kind,
+            non_specific_currents,
+            ranges,
+            globals,
+            ions,
+            description,
+            initial,
+            breakpoint,
+            derivatives,
+            states,
+            assigned,
+            units,
+            constants,
+            functions,
+            procedures,
+            parameters,
+            kinetics,
+            linears,
+            net_receive,
+        };
 
         check_duplicates_and_keywords(&res)?;
         check_scopes(&res)?;
@@ -168,27 +193,46 @@ impl Module {
         // Let's figure out some data flow
         let mut used = Map::new();
         // NET_RECEIVE, INITIAL, and BREAKPOINT are our entry points
-        if let Some(blk) = &self.initial {
-            for (k, mut v) in blk.uses().into_iter() {
-                used.entry(k).or_insert_with(Set::new).append(&mut v);
+        for blk in &[&self.initial, &self.breakpoint, &self.net_receive] {
+            if let Some(blk) = blk {
+                for (k, mut v) in blk.uses().into_iter() {
+                    used.entry(k).or_insert_with(Set::new).append(&mut v);
+                }
             }
         }
-        if let Some(blk) = &self.breakpoint {
-            for (k, mut v) in blk.uses().into_iter() {
-                used.entry(k).or_insert_with(Set::new).append(&mut v);
+
+        // Weed out vacuous blocks
+        if let Some(p) = self.initial.as_ref() {
+            if p.body.data.stmnts.is_empty() {
+                self.initial = None;
             }
         }
-        if let Some(blk) = &self.net_receive {
-            for (k, mut v) in blk.uses().into_iter() {
-                used.entry(k).or_insert_with(Set::new).append(&mut v);
+
+        if let Some(p) = self.net_receive.as_ref() {
+            if p.body.data.stmnts.is_empty() {
+                self.net_receive = None;
             }
         }
+
+        let mut void = Set::new();
+        for ps in &[&self.procedures, &self.linears, &self.kinetics] {
+            for p in ps.iter() {
+                if p.data.body.stmnts.is_empty() {
+                    void.insert(p.name.to_string());
+                }
+            }
+        }
+
+        used.retain(|k, _| !void.contains(k));
 
         // Now recurse into procedures, functions, derivatives, and kinetics.
+        // and iterate towards a fixed point to get transitive calls.
         loop {
             let mut new = used.clone();
-
             for (k, v) in &used {
+                if void.contains(k) {
+                    continue;
+                }
                 if v.contains(&Use::Solve) {
                     let blk = self
                         .kinetics
@@ -207,7 +251,7 @@ impl Module {
                         new.entry(q).or_insert_with(Set::new).append(&mut w);
                     }
                 }
-                if v.contains(&Use::CallP) {
+                if v.iter().any(|it| matches!(it, Use::CallP(_))) {
                     let blk = self
                         .procedures
                         .iter()
@@ -217,7 +261,7 @@ impl Module {
                         new.entry(q).or_insert_with(Set::new).append(&mut w);
                     }
                 }
-                if v.contains(&Use::CallF) {
+                if v.iter().any(|it| matches!(it, Use::CallF(_))) {
                     let blk = self
                         .functions
                         .iter()
@@ -648,85 +692,160 @@ impl Module {
     /// 3. Optionally: NET_RECEIVE
     /// 4. GOTO 2.
     pub fn assigned_to_local(mut self) -> Result<Self> {
-        fn first_use_of(stmnts: &[Statement], out: &mut Map<String, Use>) {
-            let mut res = Map::new();
-            for other in stmnts {
-                for (k, vs) in &other.uses() {
-                    // NOTE: in this statement
-                    //   x = x + 42
-                    // we get both a READ and a WRITE, but the READ occurs
-                    // first, so that's what we return.
-                    for u in &[Use::R, Use::W] {
-                        if vs.contains(u) {
-                            res.entry(k.to_string()).or_insert(*u);
-                        }
-                    }
-                }
-            }
-            for (k, v) in res.into_iter() {
-                if v == Use::R {
-                    // Read first disables
-                    out.insert(k, v);
-                } else {
-                    // Write may work
-                    out.entry(k).or_insert(v);
-                }
+        // Collect callable and solvable things with globally visible writes
+        let mut procs = Map::new();
+        for items in &[&self.procedures, &self.linears, &self.kinetics, &self.derivatives] {
+            for item in items.iter() {
+                procs.insert(item.data.name.to_string(), item);
             }
         }
 
-        let mut uses = Map::new();
-
-        if let Some(prc) = self.initial.as_ref() {
-            first_use_of(&prc.body.stmnts, &mut uses)
-        }
-        if let Some(prc) = &self.breakpoint {
-            for stmnt in &prc.body.stmnts {
-                if let StatementT::Solve(nm, _) = &stmnt.data {
-                    for kin in &self.kinetics {
-                        if &kin.name == nm {
-                            first_use_of(&kin.body.stmnts, &mut uses);
+        fn first_use_of(
+            others: &[Statement],
+            procs: &Map<String, &Callable>,
+        ) -> Map<String, Vec<Use>> {
+            fn first_use_of_(
+                others: &[Statement],
+                procs: &Map<String, &Callable>,
+                out: &mut Map<String, Vec<Use>>,
+            ) {
+                for other in others {
+                    // We _still_ do this even despite treating Call below, as the
+                    // _arguments_ are used _before_ entering the call
+                    for (k, vs) in &other.uses() {
+                        // NOTE we enter Read before Writes, eg X = X + 1
+                        if vs.contains(&Use::R) {
+                            out.entry(k.to_string()).or_default().push(Use::R);
+                        }
+                        if vs.contains(&Use::W) {
+                            out.entry(k.to_string()).or_default().push(Use::W);
                         }
                     }
-                    for blk in &self.derivatives {
-                        if &blk.name == nm {
-                            first_use_of(&blk.body.stmnts, &mut uses);
+                    match &other.data {
+                        StatementT::Solve(what, _) => {
+                            if let Some(what) = procs.get(what) {
+                                first_use_of_(&what.data.body.stmnts, procs, out);
+                            } else {
+                                eprintln!("Couldn't find {what} in table.")
+                            }
                         }
+                        StatementT::Call(Expression {
+                            data: ExpressionT::Call(what, _),
+                            ..
+                        }) if procs.contains_key(what) => {
+                            panic!("Found a call to a PROCEDURE in the localise pass, this is unsound! Please completely inline PROCEDUREs first!");
+                        }
+                        _ => {}
                     }
                 }
             }
-            first_use_of(&prc.body.stmnts, &mut uses);
-        }
-        if let Some(prc) = self.breakpoint.as_ref() {
-            first_use_of(&prc.body.stmnts, &mut uses)
+
+            let mut uses = Map::new();
+            first_use_of_(others, &procs, &mut uses);
+            // Collapse consecutive items
+            for vs in uses.values_mut() {
+                vs.dedup();
+            }
+            uses.retain(|_, v| !v.is_empty());
+            uses
         }
 
+        let init = if let Some(prc) = self.initial.as_ref() {
+            first_use_of(&prc.body.stmnts, &procs)
+        } else {
+            Map::new()
+        };
+
+        let brea = if let Some(prc) = &self.breakpoint {
+            first_use_of(&prc.body.stmnts, &procs)
+        } else {
+            Map::new()
+        };
+
+        let recv = if let Some(prc) = &self.net_receive {
+            first_use_of(&prc.body.stmnts, &procs)
+        } else {
+            Map::new()
+        };
+
+        let mut eliminated = Set::new();
         for assign in &self.assigned {
-            // NOTE: We don't touch unused variables here, these will be
-            // eliminated completely by another pass.
-            if let Some(Use::W) = uses.get(&assign.name) {
-                if let Some(prc) = self.initial.as_mut() {
-                    prc.body.locals.push(assign.clone())
+            let nm = assign.name.to_string();
+            // Condition: Either we write initially to var, ...
+            let ini = init.contains_key(&nm) && *init[&nm].first().unwrap() == Use::W;
+            let bpi = brea.contains_key(&nm) && *brea[&nm].first().unwrap() == Use::W;
+            let rci = recv.contains_key(&nm) && *recv[&nm].first().unwrap() == Use::W;
+
+            // ... never do anything with it, or ...
+            let inn = !init.contains_key(&nm);
+            let bpn = !brea.contains_key(&nm);
+            let rcn = !recv.contains_key(&nm);
+
+            // _read_ a variable
+            let inr = init.contains_key(&nm) && init[&nm].contains(&Use::R);
+            let bpr = brea.contains_key(&nm) && brea[&nm].contains(&Use::R);
+            let rcr = recv.contains_key(&nm) && recv[&nm].contains(&Use::R);
+
+            // We have some cases here: The variable is...
+            // 1. always written before being read => localise
+            // 2. never used => eliminate
+            // 3. written in INITIAL and consumed in later blocks. We _potentially_ want to eliminate,
+            //    iff the computation is cheap. What is cheap, though.
+            // 4. Anything else.
+
+            if inn && bpn && rcn {
+                // Eliminate unused ASSIGNED
+                eliminated.insert(nm.to_string());
+            } else if ini && (bpi || bpn) && (rci || rcn) {
+                // LOCALise if always written first
+                eliminated.insert(nm.to_string());
+                // ... if we consume the variable, put them into LOCAL
+                if inr {
+                    self.breakpoint
+                        .as_mut()
+                        .map(|p| p.body.data.locals.push(assign.clone()));
                 }
-                if let Some(prc) = self.breakpoint.as_mut() {
-                    prc.body.locals.push(assign.clone())
+                if bpr {
+                    self.net_receive
+                        .as_mut()
+                        .map(|p| p.body.data.locals.push(assign.clone()));
                 }
-                if let Some(prc) = self.net_receive.as_mut() {
-                    prc.body.locals.push(assign.clone())
-                }
-                for blk in self.derivatives.iter_mut() {
-                    blk.body.locals.push(assign.clone());
-                }
-                for blk in self.kinetics.iter_mut() {
-                    blk.body.locals.push(assign.clone());
+                if rcr {
+                    self.initial
+                        .as_mut()
+                        .map(|p| p.body.data.locals.push(assign.clone()));
                 }
             }
+            // Treat unintialised reads
+            if !ini && inr {
+                return Err(ModcxxError::UninitialisedAssigned(
+                    nm.to_string(),
+                    "INITIAL".into(),
+                ));
+            }
+            if !ini && !bpi && bpr {
+                return Err(ModcxxError::UninitialisedAssigned(
+                    nm.to_string(),
+                    "BREAKPOINT".into(),
+                ));
+            }
+            if !ini && !bpi && !rci && rcr {
+                return Err(ModcxxError::UninitialisedAssigned(
+                    nm.to_string(),
+                    "BREAKPOINT".into(),
+                ));
+            }
         }
-        self.assigned.retain(|var| {
-            uses.get(&var.name)
-                .as_ref()
-                .map(|u| **u != Use::W)
-                .unwrap_or(true)
-        });
+        self.assigned.retain(|var| !eliminated.contains(&var.name));
+        Ok(self)
+    }
+
+    pub fn kinetic_to_sparse(mut self) -> Result<Self> {
+        for kin in self.kinetics.into_iter() {
+            let der = kinetic_to_sparse(kin)?.simplify()?;
+            self.derivatives.push(der);
+        }
+        self.kinetics = Vec::new();
         Ok(self)
     }
 
@@ -806,34 +925,33 @@ fn inline_into_block(blk: &mut Block, procs: &Map<String, (Vec<String>, Block)>)
 fn check_duplicates_and_keywords(module: &Module) -> Result<()> {
     fn check(name: &str, loc: Location, seen: &mut Map<String, Location>) -> Result<()> {
         if let Some(old) = seen.get(name) {
-            return Err(ModcxxError::DuplicateSymbol(
-                name.to_string(),
-                loc,
-                *old,
-            ));
+            return Err(ModcxxError::DuplicateSymbol(name.to_string(), loc, *old));
         }
         if KEYWORDS.iter().find(|p| p.0 == name).is_some() {
-            return Err(ModcxxError::ReservedWord(
-                name.to_string(), loc,))
+            return Err(ModcxxError::ReservedWord(name.to_string(), loc));
         }
         seen.insert(name.to_string(), loc);
         Ok(())
     }
 
     let mut seen = Map::new();
-    for items in &[&module.non_specific_currents,
-                   &module.assigned,
-                   &module.parameters,
-                   &module.constants,] {
+    for items in &[
+        &module.non_specific_currents,
+        &module.assigned,
+        &module.parameters,
+        &module.constants,
+    ] {
         for item in items.iter() {
             check(&item.name, item.loc, &mut seen)?;
         }
     }
 
-    for items in &[&module.derivatives,
-                   &module.kinetics,
-                   &module.functions,
-                   &module.procedures,] {
+    for items in &[
+        &module.derivatives,
+        &module.kinetics,
+        &module.functions,
+        &module.procedures,
+    ] {
         for item in items.iter() {
             check(&item.name, item.loc, &mut seen)?;
         }
@@ -843,36 +961,85 @@ fn check_duplicates_and_keywords(module: &Module) -> Result<()> {
 }
 
 fn check_scopes(module: &Module) -> Result<()> {
-    fn check(uses: &Map<String, Set<Use>>,
-             globals: &Map<String, Access>,
-             functions: &Set<String>) -> Result<()>{
+    fn check(
+        uses: &Map<String, Vec<(Use, Location)>>,
+        globals: &Map<String, Access>,
+        solvables: &Set<String>,
+        functions: &Map<String, usize>,
+    ) -> Result<()> {
         for (var, acc) in uses {
-            if functions.contains(var) {
-                if acc.contains(&Use::R) || acc.contains(&Use::W) {
-                    return Err(ModcxxError::CallableNotVariable(var.to_string(), Location::default()));
+            if let Some(n) = functions.get(var) {
+                for (inv, loc) in acc {
+                    match inv {
+                        Use::R | Use::W => {
+                            return Err(ModcxxError::CallableNotVariable(var.to_string(), *loc))
+                        }
+                        Use::CallF(m) | Use::CallP(m) if *n != *m => {
+                            return Err(ModcxxError::WrongArity(var.to_string(), *n, *m, *loc))
+                        }
+                        Use::CallF(_) | Use::CallP(_) => {} // OK
+                        Use::Solve => {
+                            return Err(ModcxxError::CallableNotSolvable(var.to_string(), *loc))
+                        }
+                        Use::Unknown => {} // Maybe OK
+                    }
                 }
             } else if let Some(v) = globals.get(var) {
-                if acc.contains(&Use::W) && *v == Access::RO {
-                    return Err(ModcxxError::WriteToRO(var.to_string(), Location::default()));
+                for (inv, loc) in acc {
+                    match inv {
+                        Use::R => {}
+                        Use::W if *v == Access::RO => {
+                            return Err(ModcxxError::WriteToRO(var.to_string(), *loc))
+                        }
+                        Use::W => {}
+                        Use::Solve => {
+                            return Err(ModcxxError::CallableNotSolvable(var.to_string(), *loc))
+                        }
+                        Use::CallP(_) | Use::CallF(_) => {
+                            return Err(ModcxxError::VariableNotCallable(var.to_string(), *loc))
+                        }
+                        Use::Unknown => {}
+                    }
                 }
-                if acc.contains(&Use::CallF) || acc.contains(&Use::CallP) {
-                    return Err(ModcxxError::VariableNotCallable(var.to_string(), Location::default()));
+            } else if solvables.contains(var) {
+                for (inv, loc) in acc {
+                    match inv {
+                        Use::R | Use::W => {
+                            return Err(ModcxxError::SolvableNotVariable(var.to_string(), *loc))
+                        }
+                        Use::CallP(_) | Use::CallF(_) => {
+                            return Err(ModcxxError::SolvableNotCallable(var.to_string(), *loc))
+                        }
+                        Use::Solve => {}
+                        Use::Unknown => {}
+                    }
                 }
             } else {
-                return Err(ModcxxError::UnboundName(var.to_string(), Location::default()));
+                return Err(ModcxxError::UnboundName(
+                    var.to_string(),
+                    acc.first().unwrap().1,
+                ));
             }
         }
         Ok(())
     }
 
     let mut globals = Map::new();
-    for vars in &[&module.constants,
-                   &module.parameters,
-                   &module.states,
-                   &module.assigned,] {
+    for g in &KNOWN {
+        globals.insert(g.0.to_string(), Access::RO);
+    }
+    for vars in &[
+        &module.constants,
+        &module.parameters,
+        &module.states,
+        &module.assigned,
+    ] {
         for var in vars.iter() {
             globals.insert(var.name.to_string(), var.access);
         }
+    }
+    for var in &module.states {
+        globals.insert(format!("{}'", var.name), var.access);
     }
 
     for var in &module.non_specific_currents {
@@ -885,33 +1052,489 @@ fn check_scopes(module: &Module) -> Result<()> {
         }
     }
 
-
-    let mut funcs = Set::new();
-    for items in &[&module.kinetics,
-                   &module.procedures,
-                   &module.functions,] {
+    let mut funcs = FUNCTIONS
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect::<Map<String, usize>>();
+    for items in &[
+        //&module.kinetics, NO! not this
+        &module.procedures,
+        &module.functions,
+    ] {
         for item in items.iter() {
-            funcs.insert(item.name.to_string());
+            funcs.insert(
+                item.name.to_string(),
+                item.args.as_deref().map_or(0, |args| args.len()),
+            );
         }
     }
 
-
-    for items in &[&module.derivatives,
-                   &module.kinetics,
-                   &module.functions,
-                   &module.procedures,] {
+    let mut solves = Set::new();
+    for items in &[&module.linears, &module.kinetics] {
         for item in items.iter() {
-            check(&item.uses(), &globals, &funcs)?;
+            solves.insert(item.name.to_string());
         }
     }
 
-    for item in &[&module.breakpoint,
-                  &module.initial,
-                  &module.net_receive] {
+    for items in &[
+        &module.derivatives,
+        &module.kinetics,
+        &module.functions,
+        &module.linears,
+        &module.procedures,
+    ] {
+        for item in items.iter() {
+            check(&item.use_timeline(), &globals, &solves, &funcs)?;
+        }
+    }
+
+    for item in &[&module.breakpoint, &module.initial, &module.net_receive] {
         if let Some(f) = item {
-            check(&f.uses(), &globals, &funcs)?;
+            check(&f.use_timeline(), &globals, &solves, &funcs)?;
         }
     }
 
     Ok(())
+}
+/// Take a series of KINETIC reaction statements like
+///   ~ aX + bY <-> cZ (kf, kb)
+/// and produce a sparse ODE system.
+/// First we elaborate the reversible reaction to
+/// ~ aX + bY -- kf --> cZ
+/// ~ cZ      -- kb --> aX + bY
+/// Second, we compute the reaction rates
+///   rf = kf X^a Y^b
+///   rb = kb Z^c
+/// and, third, write out the system of ODEs
+///   X' = -a rf + a rb = a (rb - rf)
+///   Y' =                b (rb - rf)
+///   Z' =                c (rb - rf)
+/// by way of the Law of Mass Action.
+/// In general, if we are given
+///  ---                      ---
+///  >    n   X   -- k_j -->  >    m    X
+///  ---   ij  i              ---   ij   i
+///   i                        i
+/// the rates are
+///           ----- n_ij
+///   r  = k   | | X
+///    j    j  | |  i
+///             i
+/// and the ODEs are
+///       ---
+/// X'  = >    (m   - n  ) r
+///  i    ---    ij    ij   j
+///        i
+/// NOTE: We collect all statements by type, thus
+/// KINETIC foobar {
+///    LOCAL x, y
+///
+///    x = 23*v
+///    y = 42*v
+///
+///    ~ A <-> B (x, y)
+///
+///    x = sin(y)
+///    y = cos(x)
+///
+///    ~ C <-> D (x, y)
+///  }
+///
+/// effectively is
+///
+/// KINETIC foobar {
+///   LOCAL x, y
+///
+///   x = 23*v
+///   y = 42*v
+///   x = sin(y)
+///   y = cos(x)
+///
+///   ~ A <-> B (x, y)
+///   ~ C <-> D (x, y)
+/// }
+///
+/// this is handled **the same** in nmodl/modcc, but _should_
+/// be an error. Bug-for-bug compatible, I guess.
+/// NOTE: What we really should be doing here is this
+///
+/// KINETIC foobar {
+///   LOCAL x, y, x2 y2
+///
+///   x = 23*v
+///   y = 42*v
+///   x2 = sin(y)
+///   y2 = cos(x)
+///
+///   ~ A <-> B (x, y)
+///   ~ C <-> D (x2, y2)
+/// }
+///
+/// Even worse is this
+///
+/// KINETIC foobar {
+///   LOCAL x, y
+///
+///   x = 23*v
+///   y = 42*v
+///
+///   if (v<0) {
+///     ~ A <-> B (x, y)
+///   } else {
+///     ~ C <-> D (y, x)
+///   }
+/// }
+///
+/// which an error in modcc, but nmodl produces
+///
+/// KINETIC foobar {
+///   LOCAL x, y,
+///
+///   x = 23*v
+///   y = 42*v
+///
+///   if (v<0) {
+///   } else {
+///   }
+///   ~ A <-> B (x, y)
+///   ~ C <-> D (y, x)
+/// }
+///
+/// Yes, really. Proper here should be this:
+///
+/// KINETIC foobar {
+///   LOCAL x, y, kAB, iAB, kCD, iCD
+///
+///   kAB = iAB = kCD = iCD = 0
+///   x = 23*v
+///   y = 42*v
+///
+///   if (v<0) {
+///     kAB = x
+///     iAB = y
+///   } else {
+///     kCD = y
+///     iCD = x
+///   }
+///   ~ A <-> B (kAB, iAB)
+///   ~ C <-> D (kCD, iCD)
+/// }
+///
+/// but this subject to combinatoric explosion and can lead to
+/// extremely large systems!
+fn kinetic_to_sparse(kin: Callable) -> Result<Callable> {
+    // Temporary fix until we parse stoich terms correctly.
+    fn extract_stoich(ex: &Expression) -> Vec<(Expression, Expression)> {
+        let mut res = Vec::new();
+        let mut todo = vec![ex.clone()];
+        while let Some(Expression { ref data, loc }) = todo.pop() {
+            match data {
+                v @ ExpressionT::Variable(_) => {
+                    res.push((
+                        Expression::number("1", Location::default()),
+                        Expression {
+                            data: v.clone(),
+                            loc,
+                        },
+                    ));
+                }
+                ExpressionT::Binary(l, Operator::Mul, r) => {
+                    let n = if let ExpressionT::Number(_) = &l.data {
+                        l.clone()
+                    } else {
+                        panic!()
+                    };
+                    let v = if let ExpressionT::Variable(_) = &r.data {
+                        r.clone()
+                    } else {
+                        panic!()
+                    };
+                    res.push((*n, *v));
+                }
+                ExpressionT::Binary(l, Operator::Add, r) => {
+                    todo.push(*r.clone());
+                    todo.push(*l.clone());
+                }
+                ExpressionT::Binary(l, Operator::Sub, r) => {
+                    todo.push(*r.clone());
+                    todo.push(*l.clone());
+                }
+                _ => panic!("Unexpected: {data:?}"),
+            }
+        }
+        res
+    }
+
+    let mut reactions = Vec::new();
+    let mut stmnts = Vec::new();
+
+    #[derive(PartialEq, Eq)]
+    enum State {
+        Normal,
+        Reaction,
+    }
+
+    let mut last = State::Normal;
+    for stmnt in &kin.body.stmnts {
+        match &stmnt.data {
+            StatementT::Linear(_, _) => {
+                return Err(ModcxxError::StatementUnsupported(
+                    "LINEAR".into(),
+                    "KINETIC".into(),
+                    stmnt.loc,
+                ))
+            }
+            StatementT::Derivative(_, _) => {
+                return Err(ModcxxError::StatementUnsupported(
+                    "DERIVATIVE".into(),
+                    "KINETIC".into(),
+                    stmnt.loc,
+                ))
+            }
+            StatementT::Rate(l, r, f, b) => {
+                last = State::Reaction;
+                let lhs = extract_stoich(l);
+                let rhs = extract_stoich(r);
+                reactions.push((lhs, rhs, f.clone(), b.clone()));
+            }
+            StatementT::Conserve(_, _) => {
+                last = State::Reaction;
+            }
+            _ => {
+                if last == State::Reaction {
+                    // TODO: Gather up all Assignments v = k here, rename v to v_2, then substitute
+                    // v -> v_2 in all downstream statements.
+                    // TODO: Go nuts if we encounter a conditional...
+                    return Err(ModcxxError::IntermingledReactionNormal(stmnt.loc));
+                }
+                stmnts.push(stmnt.clone());
+            }
+        }
+    }
+
+    let mut deriv = Map::new();
+    for (lhs, rhs, rf, rb) in &reactions {
+        // rates
+        let mut rate_fw = rf.clone();
+        for (n, v) in lhs {
+            rate_fw = Expression::mul(
+                rate_fw,
+                Expression::pow(v.clone(), n.clone(), Location::default()),
+                Location::default(),
+            );
+        }
+
+        let mut rate_bw = rb.clone();
+        for (n, v) in rhs {
+            rate_bw = Expression::mul(
+                rate_bw,
+                Expression::pow(v.clone(), n.clone(), Location::default()),
+                Location::default(),
+            );
+        }
+
+        for (n, v) in lhs {
+            let k = if let ExpressionT::Variable(v) = &v.data {
+                v.clone()
+            } else {
+                panic!()
+            };
+            deriv
+                .entry(k.clone())
+                .or_insert_with(Vec::new)
+                .push(Expression::neg(
+                    Expression::mul(rate_fw.clone(), n.clone(), Location::default()),
+                    Location::default(),
+                ));
+            deriv
+                .entry(k)
+                .or_insert_with(Vec::new)
+                .push(Expression::mul(
+                    rate_bw.clone(),
+                    n.clone(),
+                    Location::default(),
+                ));
+        }
+        for (n, v) in rhs {
+            let k = if let ExpressionT::Variable(v) = &v.data {
+                v.clone()
+            } else {
+                panic!()
+            };
+            deriv
+                .entry(k.clone())
+                .or_insert_with(Vec::new)
+                .push(Expression::neg(
+                    Expression::mul(rate_bw.clone(), n.clone(), Location::default()),
+                    Location::default(),
+                ));
+            deriv
+                .entry(k)
+                .or_insert_with(Vec::new)
+                .push(Expression::mul(
+                    rate_fw.clone(),
+                    n.clone(),
+                    Location::default(),
+                ));
+        }
+    }
+
+    for (k, mut vs) in deriv.into_iter() {
+        let mut rhs = if let Some(v) = vs.pop() {
+            v.clone()
+        } else {
+            continue;
+        };
+        while let Some(v) = vs.pop() {
+            rhs = Expression::add(rhs, v, Location::default());
+        }
+        stmnts.push(Statement::derivative(&k, rhs, Location::default()));
+    }
+    let mut body = Block::block(&kin.body.locals, &stmnts, kin.body.loc);
+    body = body.simplify()?;
+    Ok(Callable::procedure(
+        &kin.name,
+        &[],
+        None,
+        body,
+        kin.loc,
+    ))
+}
+
+impl Simplify for Module {
+    fn simplify(&self) -> Result<Self> {
+        let mut res = self.clone();
+        for ps in &mut [
+            &mut res.kinetics,
+            &mut res.procedures,
+            &mut res.derivatives,
+            &mut res.functions,
+        ] {
+            for p in ps.iter_mut() {
+                *p = p.simplify()?;
+            }
+        }
+        for op in &mut[&mut res.breakpoint,
+                       &mut res.initial,
+                       &mut res.net_receive] {
+            if let Some(ref mut p) = op {
+                *p = p.simplify()?;
+            }
+        }
+        Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arity() {
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL { LOCAL x
+   x = exp(x, x)
+ }
+
+BREAKPOINT {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::WrongArity(f, 1, 2, _)) if f == "exp"));
+    }
+
+    #[test]
+    fn test_req_blocks() {
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::MissingBlock(f)) if f == "BREAKPOINT"));
+
+        let s = par::parse(
+            "
+NEURON {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert_eq!(m, Err(ModcxxError::MissingKind));
+
+        let s = par::parse(
+            "
+BREAKPOINT {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::MissingBlock(f)) if f == "NEURON"));
+    }
+
+    #[test]
+    fn test_dup_blocks() {
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+BREAKPOINT {}
+BREAKPOINT {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::DuplicateBlock(f, _, _)) if f == "BREAKPOINT"));
+
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+BREAKPOINT {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::DuplicateBlock(f, _, _)) if f == "NEURON"));
+
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+INITIAL {}
+
+BREAKPOINT {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::DuplicateBlock(f, _, _)) if f == "INITIAL"));
+
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+BREAKPOINT {}
+
+NET_RECEIVE() {}
+NET_RECEIVE() {}
+",
+        )
+        .unwrap();
+        let m = Module::new(&s);
+        assert!(matches!(m, Err(ModcxxError::DuplicateBlock(f, _, _)) if f == "NET_RECEIVE"));
+    }
 }

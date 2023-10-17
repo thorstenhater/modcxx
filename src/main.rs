@@ -3,8 +3,10 @@ use std::fs::{self, read_to_string};
 use modcxx::{
     self,
     arb::arborize,
+    cxx::to_cxx,
     err::{ModcxxError, Result},
-    nmd::to_nmodl, cxx::to_cxx,
+    nmd::to_nmodl,
+    opt::Simplify,
 };
 
 use clap::{Parser, Subcommand};
@@ -31,20 +33,21 @@ fn main() -> Result<()> {
                 ModcxxError::InternalError(format!("Could not open input file {}", &from))
             })?;
             let src = modcxx::par::parse(&raw)?;
-            let mut new = modcxx::ast::Module::new(&src)?;
+            let mut new = modcxx::ast::Module::new(&src)?
+                ;
             loop {
                 let nxt = new
                     .clone()
-                    .eliminate_dead_blocks()?
                     .inline_procedures()?
                     // .inline_functions()?
+                    .kinetic_to_sparse()?
+                    .assigned_to_local()?
                     .eliminate_dead_blocks()?
                     .splat_blocks()?
-                    .eliminate_dead_blocks()?
                     .eliminate_dead_statements()?
                     .eliminate_dead_globals()?
                     .eliminate_dead_locals()?
-                    .assigned_to_local()?;
+                    .simplify()?;
                 if nxt == new {
                     break;
                 }
