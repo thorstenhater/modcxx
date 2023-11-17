@@ -1,13 +1,15 @@
 use crate::{
     err::{ModcxxError, Result},
+    exp::Variable,
     exp::{
         Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol,
-        Unit, Use,
+        Unit
     },
+    usr::{Use, Uses, Timeline},
     lex::KEYWORDS,
     opt::Simplify,
     par::{self, Ion, Kind},
-    src::Location,
+    loc::Location,
     Map, Set,
 };
 
@@ -36,12 +38,14 @@ pub struct Module {
     pub net_receive: Option<Callable>,
 }
 
-pub const FUNCTIONS: [(&'static str, usize); 1] = [("exp", 1)];
-pub const KNOWN: [(&'static str, &'static str); 4] = [("celsius", "degC"),
-                                                      ("v", "mV"),
-                                                      ("area", "um2"),
-                                                      ("diam", "um"),];
-
+pub const FUNCTIONS: [(&'static str, usize); 4] =
+    [("exp", 1), ("exprelr", 1), ("fabs", 1), ("log", 1)];
+pub const KNOWN: [(&'static str, &'static str); 4] = [
+    ("celsius", "degC"),
+    ("v", "mV"),
+    ("area", "um2"),
+    ("diam", "um"),
+];
 
 impl Module {
     pub fn new(module: &par::Module) -> Result<Self> {
@@ -142,9 +146,7 @@ impl Module {
 
         for var in &module.assigned {
             let nm = &var.name;
-            eprintln!("ASSIGNED {nm}");
             if !ranges.contains(nm) && !globals.contains(nm) && !KNOWN.iter().any(|p| p.0 == nm) {
-                eprintln!("++ ASSIGNED {nm}");
                 ranges.push(nm.to_string());
             }
         }
@@ -369,196 +371,131 @@ impl Module {
         Ok(self)
     }
 
-    /// This pass iteratively eliminates dead statements in all blocks. Currently
-    /// only works on completely inlined programs.
-    /// Two kinds of statements are considered 'dead':
-    /// - those never read (after being written)
-    /// - those written again before beging read
-    pub fn eliminate_dead_statements(mut self) -> Result<Self> {
-        fn should_keep(lhs: &str, stmnts: &[Statement]) -> Option<bool> {
-            for other in stmnts {
-                if let Some(us) = other.uses().get(lhs) {
-                    // NOTE: in this statement
-                    //   x = x + 42
-                    // we get both a READ and a WRITE, but the READ occurs
-                    // first, so we need to keep it.
-                    // next statment was a READ, so we have to keep it.
-                    if us.contains(&Use::R) {
-                        return Some(true);
-                    }
-                    // next statment was a WRITE, so we can discard.
-                    if us.contains(&Use::W) {
-                        return Some(false);
-                    }
-                }
+    /// This pass iteratively eliminates dead statements in all blocks.
+    /// These kinds of statements are considered 'dead':
+    /// - assignments whose targets are never read afterwards
+    /// - assignments whose targets are written twice in a row
+    /// - empty blocks
+    pub fn eliminate_dead_statements(self) -> Result<Self> {
+        // Track all things we need to keep unconditionally.
+        let mut must_keep = Set::new();
+        for cur in &self.non_specific_currents {
+            must_keep.insert(cur.name.to_string());
+        }
+        for ion in &self.ions {
+            for cur in &ion.vars {
+                must_keep.insert(cur.name.to_string());
             }
-            None
         }
 
-        fn eliminate_in_proc(
-            proc: &Callable,
-            breakpoint: &Option<Callable>,
-            net_receive: &Option<Callable>,
-            kinetics: &[Callable],
-            derivatives: &[Callable],
-            must_keep: &[String],
-        ) -> Callable {
-            let mut new = Vec::new();
-            // NOTE alphatised programs would be a nice thing...
-            for (ix, stmnt) in proc.body.stmnts.iter().enumerate() {
-                if let StatementT::Assign(lhs, _) = &stmnt.data {
-                    if must_keep.contains(lhs) {
-                        new.push(stmnt.clone());
-                        continue;
+        // Scan for all uses of a variable
+        fn extract_timeline(proc: &Option<Callable>, solvables: &[&Vec<Callable>], uses: &mut Timeline) {
+            if let Some(proc) = proc {
+                for b in &proc.solves {
+                    for blks in solvables {
+                        if let Some(blk) = blks.iter().find(|d| d.data.name == b.data.0) {
+                            for (k, ref mut vs) in blk.uses_timeline() {
+                                uses.entry(k).or_default().append(vs);
+                            }
+                        }
                     }
-                    let keep_local = should_keep(lhs, &proc.body.stmnts[ix + 1..]);
-                    // for non-locals we have to scan more blocks
-                    // * BREAKPOINT
-                    //   * if present check SOLVEd KINETICs and DERIVATIVEs in order of mention
-                    //   * then the body of BREAKPOINT
-                    let keep_break = if !proc.body.locals.iter().any(|s| &s.name == lhs) {
-                        let mut keep = None;
-                        if let Some(proc) = &breakpoint {
-                            for stmnt in &proc.body.stmnts {
-                                if let StatementT::Solve(blk, _) = &stmnt.data {
-                                    if let Some(d) = derivatives.iter().find(|p| &p.name == blk) {
-                                        keep = keep.or(should_keep(lhs, &d.body.stmnts));
-                                    }
-                                    if let Some(k) = kinetics.iter().find(|p| &p.name == blk) {
-                                        keep = keep.or(should_keep(lhs, &k.body.stmnts));
-                                    }
+                }
+                for (k, ref mut vs) in proc.uses_timeline() {
+                    uses.entry(k).or_default().append(vs);
+                }
+            }
+        }
+
+        fn eliminate_in_proc(proc: &mut Callable, tl: &Timeline, must: &Set<String>) -> Result<()> {
+            proc.body.stmnts.retain(|stmnt| {
+                match &stmnt.data {
+                    StatementT::Block(blk) => !blk.data.stmnts.is_empty(),
+                    StatementT::IfThenElse(_, t, None) => !t.data.stmnts.is_empty(),
+                    StatementT::IfThenElse(_, t, Some(e)) => !(t.data.stmnts.is_empty() && e.data.stmnts.is_empty()),
+                    StatementT::Assign(lhs, _) => {
+                        // Check whether this is a write to an external thing.
+                        if must.contains(lhs) {
+                            return true;
+                        }
+
+                        // On a write to lhs, we check whether the _next_ access
+                        // is also a write if so, we can ditch the statement.
+                        // NOTE: This only works by ordering statements by
+                        // source location, which is dubious. Example to explain:
+                        //
+                        // x = 42
+                        // if (y == 0) {
+                        //   x = 23
+                        // } else {
+                        //   y = x
+                        // }
+                        //
+                        // In this case we either read or write x where the read
+                        // comes seemingly _after_ the write. But that's an
+                        // illusion.
+                        if let Some(uses) = tl.get(lhs) {
+                            let mut it = uses.iter();
+                            while let Some((_, loc)) = it.next() {
+                                if loc > &stmnt.loc {
+                                    it.next();
+                                    break;
                                 }
                             }
-                            keep = keep.or(should_keep(lhs, &proc.body.stmnts));
+                            match it.next() {
+                                Some((Use::W, loc)) => {
+                                    eprintln!("Eliminating write to {lhs} in {:?}. Next access is write {:?}.", stmnt.loc, loc);
+                                    false
+                                }
+                                None => {
+                                    eprintln!("Eliminating write to {lhs} in {:?}. Never read again.", stmnt.loc);
+                                    false
+                                }
+                                _ => true,
+                            }
+                        } else {
+                            // Found a write without an entry in uses, so this is a local.
+                            true
                         }
-                        keep
-                    } else {
-                        None
-                    };
-                    // NET_RECEIVE *might* be interjected between two BREAKPOINTs.
-                    let keep_recv = if !proc.body.locals.iter().any(|s| &s.name == lhs) {
-                        let mut keep = None;
-                        if let Some(proc) = net_receive {
-                            keep = keep.or(should_keep(lhs, &proc.body.stmnts));
-                        }
-                        keep
-                    } else {
-                        None
-                    };
-                    // Combine sub-results
-                    let keep = keep_local.or(keep_break).or(keep_recv);
-                    // we got to the end, nobody used it ... begone
-                    if let Some(true) = keep {
-                        new.push(stmnt.clone());
                     }
-                } else {
-                    new.push(stmnt.clone());
+                    _ => true,
                 }
+            });
+            Ok(())
+        }
+
+        let solvables = &[&self.linears,
+                          &self.kinetics,
+                          &self.derivatives];
+
+        let mut module = self.clone();
+        loop {
+            let old = module.clone();
+            let mut uses = Timeline::new();
+            // We keep an ordering of blocks here...
+            extract_timeline(&module.initial, solvables, &mut uses);
+            extract_timeline(&module.breakpoint, solvables, &mut uses);
+            extract_timeline(&module.net_receive, solvables, &mut uses);
+            // ... repeating these two once as they are called once per timestep
+            extract_timeline(&module.breakpoint, solvables, &mut uses);
+            extract_timeline(&module.net_receive, solvables, &mut uses);
+
+            if let Some(ref mut proc) = module.initial {
+                eliminate_in_proc(proc, &uses, &must_keep)?;
             }
 
-            let mut res = proc.clone();
-            res.body.stmnts = new;
-            res
-        }
-
-        let mut must_keep = Vec::new();
-        for ion in &self.ions {
-            for var in &ion.vars {
-                if var.access == Access::RW {
-                    must_keep.push(var.name.to_string());
-                }
+            if let Some(ref mut proc) = module.breakpoint {
+                eliminate_in_proc(proc, &uses, &must_keep)?;
             }
-        }
-        for nsc in &self.non_specific_currents {
-            must_keep.push(nsc.name.to_string());
-        }
 
-        if let Some(ref mut proc) = &mut self.initial {
-            loop {
-                let new = eliminate_in_proc(
-                    proc,
-                    &self.breakpoint,
-                    &self.net_receive,
-                    &self.kinetics,
-                    &self.derivatives,
-                    &must_keep,
-                );
-                if &new == proc {
-                    break;
-                }
-                *proc = new;
+            if let Some(ref mut proc) = module.net_receive {
+                eliminate_in_proc(proc, &uses, &must_keep)?;
             }
-        }
-
-        if let Some(ref mut proc) = &mut self.breakpoint {
-            loop {
-                let new = eliminate_in_proc(
-                    proc,
-                    &Some(proc.clone()),
-                    &self.net_receive,
-                    &self.kinetics,
-                    &self.derivatives,
-                    &must_keep,
-                );
-                if &new == proc {
-                    break;
-                }
-                *proc = new;
+            if old == module {
+                break;
             }
         }
 
-        if let Some(ref mut proc) = &mut self.net_receive {
-            loop {
-                let new = eliminate_in_proc(
-                    proc,
-                    &self.breakpoint,
-                    &Some(proc.clone()),
-                    &self.kinetics,
-                    &self.derivatives,
-                    &must_keep,
-                );
-                if &new == proc {
-                    break;
-                }
-                *proc = new;
-            }
-        }
-
-        for proc in self.kinetics.iter_mut() {
-            loop {
-                let new = eliminate_in_proc(
-                    proc,
-                    &self.breakpoint,
-                    &self.net_receive,
-                    &[],
-                    &self.derivatives,
-                    &must_keep,
-                );
-                if &new == proc {
-                    break;
-                }
-                *proc = new;
-            }
-        }
-
-        for proc in self.derivatives.iter_mut() {
-            loop {
-                let new = eliminate_in_proc(
-                    proc,
-                    &self.breakpoint,
-                    &self.net_receive,
-                    &self.kinetics,
-                    &[],
-                    &must_keep,
-                );
-                if &new == proc {
-                    break;
-                }
-                *proc = new;
-            }
-        }
-
-        Ok(self)
+        Ok(module)
     }
 
     pub fn eliminate_dead_globals(mut self) -> Result<Self> {
@@ -694,149 +631,83 @@ impl Module {
     pub fn assigned_to_local(mut self) -> Result<Self> {
         // Collect callable and solvable things with globally visible writes
         let mut procs = Map::new();
-        for items in &[&self.procedures, &self.linears, &self.kinetics, &self.derivatives] {
+        for items in &[
+            &self.procedures,
+            &self.linears,
+            &self.kinetics,
+            &self.derivatives,
+        ] {
             for item in items.iter() {
                 procs.insert(item.data.name.to_string(), item);
             }
         }
 
-        fn first_use_of(
-            others: &[Statement],
-            procs: &Map<String, &Callable>,
-        ) -> Map<String, Vec<Use>> {
-            fn first_use_of_(
-                others: &[Statement],
-                procs: &Map<String, &Callable>,
-                out: &mut Map<String, Vec<Use>>,
-            ) {
-                for other in others {
-                    // We _still_ do this even despite treating Call below, as the
-                    // _arguments_ are used _before_ entering the call
-                    for (k, vs) in &other.uses() {
-                        // NOTE we enter Read before Writes, eg X = X + 1
-                        if vs.contains(&Use::R) {
-                            out.entry(k.to_string()).or_default().push(Use::R);
-                        }
-                        if vs.contains(&Use::W) {
-                            out.entry(k.to_string()).or_default().push(Use::W);
-                        }
+        let mut assigned_used = Set::new();
+        let mut initialised_sofar = Set::new();
+        let mut can_localise = self
+            .assigned
+            .iter()
+            .map(|v| v.name.to_string())
+            .collect::<Set<_>>();
+        for proc in &[
+            self.initial.as_ref(),
+            self.breakpoint.as_ref(),
+            self.net_receive.as_ref(),
+        ] {
+            if let Some(proc) = proc {
+                let uses = first_use_of(&proc.body.stmnts, &procs);
+                for var in &self.assigned {
+                    let nm = &var.name;
+                    if KNOWN.iter().any(|v| v.0 == nm) {
+                        can_localise.remove(nm);
+                        continue;
                     }
-                    match &other.data {
-                        StatementT::Solve(what, _) => {
-                            if let Some(what) = procs.get(what) {
-                                first_use_of_(&what.data.body.stmnts, procs, out);
-                            } else {
-                                eprintln!("Couldn't find {what} in table.")
+                    if let Some(uses) = uses.get(nm) {
+                        if let Some(Use::W) = uses.first() {
+                            initialised_sofar.insert(nm);
+                        } else {
+                            can_localise.remove(nm);
+                        }
+                        if uses.contains(&Use::R) {
+                            if !initialised_sofar.contains(&nm) {
+                                return Err(ModcxxError::UninitialisedAssigned(
+                                    nm.to_string(),
+                                    Location::default(),
+                                ));
                             }
+                            assigned_used.insert(nm.to_string());
                         }
-                        StatementT::Call(Expression {
-                            data: ExpressionT::Call(what, _),
-                            ..
-                        }) if procs.contains_key(what) => {
-                            panic!("Found a call to a PROCEDURE in the localise pass, this is unsound! Please completely inline PROCEDUREs first!");
+                        if uses.contains(&Use::W) {
+                            initialised_sofar.insert(nm);
                         }
-                        _ => {}
                     }
                 }
             }
-
-            let mut uses = Map::new();
-            first_use_of_(others, &procs, &mut uses);
-            // Collapse consecutive items
-            for vs in uses.values_mut() {
-                vs.dedup();
-            }
-            uses.retain(|_, v| !v.is_empty());
-            uses
         }
-
-        let init = if let Some(prc) = self.initial.as_ref() {
-            first_use_of(&prc.body.stmnts, &procs)
-        } else {
-            Map::new()
-        };
-
-        let brea = if let Some(prc) = &self.breakpoint {
-            first_use_of(&prc.body.stmnts, &procs)
-        } else {
-            Map::new()
-        };
-
-        let recv = if let Some(prc) = &self.net_receive {
-            first_use_of(&prc.body.stmnts, &procs)
-        } else {
-            Map::new()
-        };
-
-        let mut eliminated = Set::new();
-        for assign in &self.assigned {
-            let nm = assign.name.to_string();
-            // Condition: Either we write initially to var, ...
-            let ini = init.contains_key(&nm) && *init[&nm].first().unwrap() == Use::W;
-            let bpi = brea.contains_key(&nm) && *brea[&nm].first().unwrap() == Use::W;
-            let rci = recv.contains_key(&nm) && *recv[&nm].first().unwrap() == Use::W;
-
-            // ... never do anything with it, or ...
-            let inn = !init.contains_key(&nm);
-            let bpn = !brea.contains_key(&nm);
-            let rcn = !recv.contains_key(&nm);
-
-            // _read_ a variable
-            let inr = init.contains_key(&nm) && init[&nm].contains(&Use::R);
-            let bpr = brea.contains_key(&nm) && brea[&nm].contains(&Use::R);
-            let rcr = recv.contains_key(&nm) && recv[&nm].contains(&Use::R);
-
-            // We have some cases here: The variable is...
-            // 1. always written before being read => localise
-            // 2. never used => eliminate
-            // 3. written in INITIAL and consumed in later blocks. We _potentially_ want to eliminate,
-            //    iff the computation is cheap. What is cheap, though.
-            // 4. Anything else.
-
-            if inn && bpn && rcn {
-                // Eliminate unused ASSIGNED
-                eliminated.insert(nm.to_string());
-            } else if ini && (bpi || bpn) && (rci || rcn) {
-                // LOCALise if always written first
-                eliminated.insert(nm.to_string());
-                // ... if we consume the variable, put them into LOCAL
-                if inr {
-                    self.breakpoint
-                        .as_mut()
-                        .map(|p| p.body.data.locals.push(assign.clone()));
-                }
-                if bpr {
-                    self.net_receive
-                        .as_mut()
-                        .map(|p| p.body.data.locals.push(assign.clone()));
-                }
-                if rcr {
-                    self.initial
-                        .as_mut()
-                        .map(|p| p.body.data.locals.push(assign.clone()));
-                }
+        for var in &can_localise {
+            if !assigned_used.contains(var) {
+                continue;
             }
-            // Treat unintialised reads
-            if !ini && inr {
-                return Err(ModcxxError::UninitialisedAssigned(
-                    nm.to_string(),
-                    "INITIAL".into(),
-                ));
-            }
-            if !ini && !bpi && bpr {
-                return Err(ModcxxError::UninitialisedAssigned(
-                    nm.to_string(),
-                    "BREAKPOINT".into(),
-                ));
-            }
-            if !ini && !bpi && !rci && rcr {
-                return Err(ModcxxError::UninitialisedAssigned(
-                    nm.to_string(),
-                    "BREAKPOINT".into(),
-                ));
+            assigned_used.remove(var);
+            for proc in &mut [
+                self.initial.as_mut(),
+                self.breakpoint.as_mut(),
+                self.net_receive.as_mut(),
+            ] {
+                if let Some(proc) = proc {
+                    if proc
+                        .uses()
+                        .get(var)
+                        .map_or(false, |us| us.contains(&Use::R))
+                    {
+                        let loc = proc.loc;
+                        proc.body.locals.push(Variable::local(var, loc));
+                    }
+                }
             }
         }
-        self.assigned.retain(|var| !eliminated.contains(&var.name));
+        self.assigned
+            .retain(|var| assigned_used.contains(&var.name));
         Ok(self)
     }
 
@@ -896,10 +767,14 @@ fn inline_into_block(blk: &mut Block, procs: &Map<String, (Vec<String>, Block)>)
             match stmnt.data {
                 StatementT::Call(Expression {
                     data: ExpressionT::Call(ref cname, ref cargs),
-                    ..
+                    loc
                 }) => {
                     if let Some((pargs, pbody)) = procs.get(cname) {
                         let mut new = Statement::block(pbody.clone());
+                        let lut = pbody.locals.iter()
+                                              .map(|l| (l.name.clone(), format!("{}_{}_{}", l.name, loc.line, loc.column)))
+                                              .collect::<Map<String, String>>();
+                        new = new.rename_all(&lut)?;
                         for (f, t) in pargs.iter().zip(cargs.iter()) {
                             new = new.substitute(&ExpressionT::Variable(f.to_string()), t)?
                         }
@@ -960,70 +835,70 @@ fn check_duplicates_and_keywords(module: &Module) -> Result<()> {
     Ok(())
 }
 
-fn check_scopes(module: &Module) -> Result<()> {
-    fn check(
-        uses: &Map<String, Vec<(Use, Location)>>,
-        globals: &Map<String, Access>,
-        solvables: &Set<String>,
-        functions: &Map<String, usize>,
-    ) -> Result<()> {
-        for (var, acc) in uses {
-            if let Some(n) = functions.get(var) {
-                for (inv, loc) in acc {
-                    match inv {
-                        Use::R | Use::W => {
-                            return Err(ModcxxError::CallableNotVariable(var.to_string(), *loc))
-                        }
-                        Use::CallF(m) | Use::CallP(m) if *n != *m => {
-                            return Err(ModcxxError::WrongArity(var.to_string(), *n, *m, *loc))
-                        }
-                        Use::CallF(_) | Use::CallP(_) => {} // OK
-                        Use::Solve => {
-                            return Err(ModcxxError::CallableNotSolvable(var.to_string(), *loc))
-                        }
-                        Use::Unknown => {} // Maybe OK
+fn check_scope(
+    uses: &Map<String, Vec<(Use, Location)>>,
+    globals: &Map<String, Access>,
+    solvables: &Set<String>,
+    functions: &Map<String, usize>,
+) -> Result<()> {
+    for (var, acc) in uses {
+        if let Some(n) = functions.get(var) {
+            for (inv, loc) in acc {
+                match inv {
+                    Use::R | Use::W => {
+                        return Err(ModcxxError::CallableNotVariable(var.to_string(), *loc))
                     }
-                }
-            } else if let Some(v) = globals.get(var) {
-                for (inv, loc) in acc {
-                    match inv {
-                        Use::R => {}
-                        Use::W if *v == Access::RO => {
-                            return Err(ModcxxError::WriteToRO(var.to_string(), *loc))
-                        }
-                        Use::W => {}
-                        Use::Solve => {
-                            return Err(ModcxxError::CallableNotSolvable(var.to_string(), *loc))
-                        }
-                        Use::CallP(_) | Use::CallF(_) => {
-                            return Err(ModcxxError::VariableNotCallable(var.to_string(), *loc))
-                        }
-                        Use::Unknown => {}
+                    Use::CallF(m) | Use::CallP(m) if *n != *m => {
+                        return Err(ModcxxError::WrongArity(var.to_string(), *n, *m, *loc))
                     }
-                }
-            } else if solvables.contains(var) {
-                for (inv, loc) in acc {
-                    match inv {
-                        Use::R | Use::W => {
-                            return Err(ModcxxError::SolvableNotVariable(var.to_string(), *loc))
-                        }
-                        Use::CallP(_) | Use::CallF(_) => {
-                            return Err(ModcxxError::SolvableNotCallable(var.to_string(), *loc))
-                        }
-                        Use::Solve => {}
-                        Use::Unknown => {}
+                    Use::CallF(_) | Use::CallP(_) => {} // OK
+                    Use::Solve => {
+                        return Err(ModcxxError::CallableNotSolvable(var.to_string(), *loc))
                     }
+                    Use::Unknown => {} // Maybe OK
                 }
-            } else {
-                return Err(ModcxxError::UnboundName(
-                    var.to_string(),
-                    acc.first().unwrap().1,
-                ));
             }
+        } else if let Some(v) = globals.get(var) {
+            for (inv, loc) in acc {
+                match inv {
+                    Use::R => {}
+                    Use::W if *v == Access::RO => {
+                        return Err(ModcxxError::WriteToRO(var.to_string(), *loc))
+                    }
+                    Use::W => {}
+                    Use::Solve => {
+                        return Err(ModcxxError::VariableNotSolvable(var.to_string(), *loc))
+                    }
+                    Use::CallP(_) | Use::CallF(_) => {
+                        return Err(ModcxxError::VariableNotCallable(var.to_string(), *loc))
+                    }
+                    Use::Unknown => {}
+                }
+            }
+        } else if solvables.contains(var) {
+            for (inv, loc) in acc {
+                match inv {
+                    Use::R | Use::W => {
+                        return Err(ModcxxError::SolvableNotVariable(var.to_string(), *loc))
+                    }
+                    Use::CallP(_) | Use::CallF(_) => {
+                        return Err(ModcxxError::SolvableNotCallable(var.to_string(), *loc))
+                    }
+                    Use::Solve => {}
+                    Use::Unknown => {}
+                }
+            }
+        } else {
+            return Err(ModcxxError::UnboundName(
+                var.to_string(),
+                acc.first().unwrap().1,
+            ));
         }
-        Ok(())
     }
+    Ok(())
+}
 
+fn check_scopes(module: &Module) -> Result<()> {
     let mut globals = Map::new();
     for g in &KNOWN {
         globals.insert(g.0.to_string(), Access::RO);
@@ -1070,7 +945,7 @@ fn check_scopes(module: &Module) -> Result<()> {
     }
 
     let mut solves = Set::new();
-    for items in &[&module.linears, &module.kinetics] {
+    for items in &[&module.linears, &module.kinetics, &module.derivatives] {
         for item in items.iter() {
             solves.insert(item.name.to_string());
         }
@@ -1084,13 +959,13 @@ fn check_scopes(module: &Module) -> Result<()> {
         &module.procedures,
     ] {
         for item in items.iter() {
-            check(&item.use_timeline(), &globals, &solves, &funcs)?;
+            check_scope(&item.uses_timeline(), &globals, &solves, &funcs)?;
         }
     }
 
     for item in &[&module.breakpoint, &module.initial, &module.net_receive] {
         if let Some(f) = item {
-            check(&f.use_timeline(), &globals, &solves, &funcs)?;
+            check_scope(&f.uses_timeline(), &globals, &solves, &funcs)?;
         }
     }
 
@@ -1392,13 +1267,7 @@ fn kinetic_to_sparse(kin: Callable) -> Result<Callable> {
     }
     let mut body = Block::block(&kin.body.locals, &stmnts, kin.body.loc);
     body = body.simplify()?;
-    Ok(Callable::procedure(
-        &kin.name,
-        &[],
-        None,
-        body,
-        kin.loc,
-    ))
+    Ok(Callable::procedure(&kin.name, &[], None, body, kin.loc))
 }
 
 impl Simplify for Module {
@@ -1414,9 +1283,7 @@ impl Simplify for Module {
                 *p = p.simplify()?;
             }
         }
-        for op in &mut[&mut res.breakpoint,
-                       &mut res.initial,
-                       &mut res.net_receive] {
+        for op in &mut [&mut res.breakpoint, &mut res.initial, &mut res.net_receive] {
             if let Some(ref mut p) = op {
                 *p = p.simplify()?;
             }
@@ -1425,8 +1292,54 @@ impl Simplify for Module {
     }
 }
 
+fn first_use_of(others: &[Statement], procs: &Map<String, &Callable>) -> Map<String, Vec<Use>> {
+    fn first_use_of_(
+        others: &[Statement],
+        procs: &Map<String, &Callable>,
+        out: &mut Map<String, Vec<Use>>,
+    ) {
+        for other in others {
+            match &other.data {
+                StatementT::Block(inner) => {
+                    first_use_of_(&inner.stmnts, procs, out);
+                }
+                StatementT::Call(Expression {
+                    data: ExpressionT::Call(what, _),
+                    ..
+                }) if procs.contains_key(what) => {
+                    panic!(
+                        "Found a call to a PROCEDURE! Please completely inline PROCEDUREs first!"
+                    );
+                }
+                _ => {
+                    for (k, vs) in other.uses() {
+                        // NOTE we enter Read before Writes, eg X = X + 1
+                        if vs.contains(&Use::R) {
+                            out.entry(k.to_string()).or_default().push(Use::R);
+                        }
+                        if vs.contains(&Use::W) {
+                            out.entry(k.to_string()).or_default().push(Use::W);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut uses = Map::new();
+    first_use_of_(others, &procs, &mut uses);
+    // Collapse consecutive items
+    for vs in uses.values_mut() {
+        vs.dedup();
+    }
+    uses.retain(|_, v| !v.is_empty());
+    uses
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::par::Parser;
+
     use super::*;
 
     #[test]
@@ -1536,5 +1449,153 @@ NET_RECEIVE() {}
         .unwrap();
         let m = Module::new(&s);
         assert!(matches!(m, Err(ModcxxError::DuplicateBlock(f, _, _)) if f == "NET_RECEIVE"));
+    }
+
+    #[test]
+    fn fst_use() {
+        let b = Parser::new_from_str(
+            "{
+  mAlpha = malphaF * vtrap(-(v - mvhalf), mk)
+  mBeta = mbetaF * vtrap(v - mvhalf, mk)
+  mInf = mAlpha / (mAlpha + mBeta)
+  hAlpha = halphaF * vtrap(v - hvhalf, hk)
+  hBeta = hbetaF * vtrap(-(v - hvhalf), hk)
+  hInf = hAlpha / (hAlpha + hBeta)
+  m = mInf
+  h = hInf
+}",
+        )
+        .block()
+        .unwrap();
+        let fst_use = first_use_of(&b.stmnts, &Default::default());
+        for v in &["mAlpha", "mBeta", "mInf", "hAlpha", "hBeta", "hInf"] {
+            assert_eq!(fst_use.get(&v.to_string()).unwrap().first(), Some(&Use::W));
+        }
+        let b = Parser::new_from_str(
+            "{
+{
+    mAlpha = malphaF * vtrap(-(v - mvhalf), mk)
+    mBeta = mbetaF * vtrap(v - mvhalf, mk)
+    mInf = mAlpha / (mAlpha + mBeta)
+    hAlpha = halphaF * vtrap(v - hvhalf, hk)
+    hBeta = hbetaF * vtrap(-(v - hvhalf), hk)
+    hInf = hAlpha / (hAlpha + hBeta)
+}
+  m = mInf
+  h = hInf
+}",
+        )
+        .block()
+        .unwrap();
+        let fst_use = first_use_of(&b.stmnts, &Default::default());
+        for v in &["mAlpha", "mBeta", "mInf", "hAlpha", "hBeta", "hInf"] {
+            assert_eq!(fst_use.get(&v.to_string()).unwrap().first(), Some(&Use::W));
+        }
+    }
+
+    #[test]
+    fn scope() {
+        let d = Parser::new_from_str("DERIVATIVE dZ { z' = (z_inf(cai) - z)/zTau }")
+            .derivative()
+            .unwrap();
+        let u = d.uses_timeline();
+        let c = check_scope(&u,
+                            &[("z".to_string(), Access::RW),
+                              ("z'".to_string(), Access::RW),
+                              ("cai".to_string(), Access::RO),
+                              ("zTau".to_string(), Access::RO),
+                            ].into_iter().collect::<Map<_, _>>(),
+                            &Default::default(),
+                            &[("z_inf".to_string(), 1)].into_iter().collect::<Map<_, _>>());
+        assert!(c.is_ok());
+    }
+
+    #[test]
+    fn dead_statements() {
+            let s = par::parse(
+            "
+NEURON {
+  SUFFIX test
+  NONSPECIFIC_CURRENT il
+}
+
+ASSIGNED { x y z }
+
+INITIAL {
+  x = 42
+  y = x + x
+}
+
+BREAKPOINT {
+  z = x*x
+  il = z
+}
+",
+        )
+        .unwrap();
+        let mut m = Module::new(&s).unwrap();
+        m = m.eliminate_dead_statements().unwrap();
+        m = m.eliminate_dead_globals().unwrap();
+        assert_eq!(m.assigned.iter().map(|v| v.name.to_string()).collect::<Vec<_>>(),
+                   ["x".to_string(), "z".to_string()].to_vec());
+
+            let s = par::parse(
+            "
+NEURON {
+  SUFFIX test
+  NONSPECIFIC_CURRENT il
+}
+
+ASSIGNED { x y z }
+
+INITIAL {
+  x = 42
+  y = x + x
+}
+
+BREAKPOINT {
+  z = x*y
+  il = z
+}
+",
+        )
+        .unwrap();
+        let mut m = Module::new(&s).unwrap();
+        m = m.eliminate_dead_statements().unwrap();
+        m = m.eliminate_dead_globals().unwrap();
+        assert_eq!(m.assigned.iter().map(|v| v.name.to_string()).collect::<Vec<_>>(),
+                   ["x".to_string(), "y".to_string(), "z".to_string()].to_vec());
+
+            let s = par::parse(
+            "
+NEURON {
+  SUFFIX test
+  NONSPECIFIC_CURRENT il
+}
+
+ASSIGNED { x y z }
+
+INITIAL {
+  x = 42
+  y = x + x
+}
+
+BREAKPOINT {
+  if (il < 0) {
+    z = x
+  } else {
+    z = y
+  }
+
+  il = z
+}
+",
+        )
+        .unwrap();
+        let mut m = Module::new(&s).unwrap();
+        m = m.eliminate_dead_statements().unwrap();
+        m = m.eliminate_dead_globals().unwrap();
+        assert_eq!(m.assigned.iter().map(|v| v.name.to_string()).collect::<Vec<_>>(),
+                   ["x".to_string(), "y".to_string(), "z".to_string()].to_vec());
     }
 }

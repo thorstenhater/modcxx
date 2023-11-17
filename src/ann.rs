@@ -1,6 +1,8 @@
-use crate::err::{ModcxxError, Result};
-use crate::src::Location;
-use crate::Map;
+use crate::{
+    err::{ModcxxError, Result},
+    loc::Location,
+    Map
+};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Metadata {

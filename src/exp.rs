@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug};
 use std::ops::{Deref, DerefMut};
 
-use crate::{err::Result, src::Location, Map, Set};
+use crate::{err::Result, loc::Location, Map, Set, usr::{Use, Uses}};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WithLocation<T: Clone + PartialEq + Eq + Debug> {
@@ -134,75 +134,38 @@ impl Block {
         }
     }
 
-    pub fn uses(&self) -> Map<String, Set<Use>> {
-        let mut res: Map<_, Set<_>> = Map::new();
-        let locals = self
-            .locals
-            .iter()
-            .map(|s| s.name.to_string())
-            .collect::<Set<_>>();
-        for stmnt in &self.stmnts {
-            for (k, mut vs) in stmnt.uses().into_iter() {
-                if !locals.contains(&k) {
-                    res.entry(k).or_default().append(&mut vs);
-                }
-            }
-        }
-        res
-    }
-
-    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res: Map<_, Vec<_>> = Map::new();
-        let locals = self
-            .locals
-            .iter()
-            .map(|s| s.name.to_string())
-            .collect::<Set<_>>();
-        for stmnt in &self.stmnts {
-            for (k, mut vs) in stmnt.use_timeline().into_iter() {
-                if !locals.contains(&k) {
-                    res.entry(k).or_default().append(&mut vs);
-                }
-            }
-        }
-        res
-    }
-
     pub fn splat_blocks(&self) -> Result<Self> {
-        let mut locals = self.locals.clone();
-        let mut stmnts = self.stmnts.clone();
-        loop {
-            let mut new = Vec::new();
-            for stmnt in &stmnts {
+        let mut res = self.clone();
+        let mut done = false;
+        while !done {
+            done = true;
+            let mut stmnts = Vec::new();
+            let mut locals = res.locals.clone();
+            for stmnt in &res.stmnts {
                 if let StatementT::Block(inner) = &stmnt.data {
-                    eprintln!(
-                        "Inner block at {:?} has LOCAL {:?}",
-                        inner.loc,
-                        inner
-                            .locals
-                            .iter()
-                            .map(|s| s.name.to_string())
-                            .collect::<Vec<_>>()
-                    );
-                    locals.append(&mut inner.locals.clone());
-                    eprintln!(
-                        "LOCALS now {:?}",
-                        locals
-                            .iter()
-                            .map(|s| s.name.to_string())
-                            .collect::<Vec<_>>()
-                    );
-                    new.append(&mut inner.stmnts.clone());
+                    let mut substs = Map::new();
+                    for local in &inner.locals {
+                        let mut nm = local.name.to_string();
+                        let mut idx = 0;
+                        while locals.iter().any(|l| l.name == nm) {
+                            nm = format!("{}_{}", local.name, idx);
+                            idx += 1;
+                        }
+                        locals.push(local.rename(&nm));
+                        substs.insert(local.name.to_string(), nm);
+                    }
+                    for stmnt in &inner.stmnts {
+                        stmnts.push(stmnt.rename_all(&substs)?);
+                    }
+                    done = false;
                 } else {
-                    new.push(stmnt.clone());
+                    stmnts.push(stmnt.clone());
                 }
             }
-            if new == stmnts {
-                break;
-            }
-            stmnts = new;
+            res.data.locals = locals;
+            res.data.stmnts = stmnts;
         }
-        Ok(Block::block(&locals, &stmnts, self.loc))
+        Ok(res)
     }
 
     fn substitute(&self, from: &ExpressionT, to: &ExpressionT) -> Result<Self> {
@@ -212,19 +175,35 @@ impl Block {
         }
         Ok(res)
     }
+
+    fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
+        let locals = self.locals.iter().map(|l| l.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+        let stmnts = self.stmnts.iter().map(|l| l.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+
+        Ok(Self::block(&locals, &stmnts, self.loc))
+    }
+}
+
+impl Uses for Block {
+    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
+        let mut res: Map<_, Vec<_>> = Map::new();
+        let locals = self
+            .locals
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect::<Set<_>>();
+        for stmnt in &self.stmnts {
+            for (k, mut vs) in stmnt.uses_timeline().into_iter() {
+                if !locals.contains(&k) {
+                    res.entry(k).or_default().append(&mut vs);
+                }
+            }
+        }
+        res
+    }
 }
 
 pub type Statement = WithLocation<StatementT>;
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Use {
-    R,
-    W,
-    Solve,
-    CallP(usize),
-    CallF(usize),
-    Unknown, // Might be anything... can happen if we cross an if with different usage
-}
 
 impl Statement {
     pub fn assign(lhs: &str, rhs: Expression, loc: Location) -> Self {
@@ -257,24 +236,6 @@ impl Statement {
         Statement::new(StatementT::Derivative(lhs.to_string(), rhs), loc)
     }
 
-    pub fn solve_default(lhs: &str, loc: Location) -> Self {
-        Statement::new(StatementT::Solve(lhs.to_string(), Solver::Default), loc)
-    }
-
-    pub fn solve(lhs: &str, m: &str, loc: Location) -> Self {
-        Statement::new(
-            StatementT::Solve(lhs.to_string(), Solver::Method(m.into())),
-            loc,
-        )
-    }
-
-    pub fn steadystate(lhs: &str, m: &str, loc: Location) -> Self {
-        Statement::new(
-            StatementT::Solve(lhs.to_string(), Solver::SteadyState(m.to_string())),
-            loc,
-        )
-    }
-
     pub fn if_then_else(i: Expression, t: Block, e: Option<Block>, loc: Location) -> Self {
         Statement::new(StatementT::IfThenElse(i, t, e), loc)
     }
@@ -285,254 +246,6 @@ impl Statement {
 
     pub fn call(fun: &str, args: Vec<Expression>, loc: Location) -> Self {
         Statement::new(StatementT::Call(Expression::call(fun, args, loc)), loc)
-    }
-
-    pub fn uses(&self) -> Map<String, Set<Use>> {
-        let mut res: Map<String, Set<Use>> = Map::new();
-        match &self.data {
-            StatementT::Linear(lhs, rhs) => {
-                for v in lhs
-                    .variables()
-                    .into_iter()
-                    .chain(rhs.variables().into_iter())
-                {
-                    res.entry(v.to_string())
-                        .or_default()
-                        .extend(&[Use::R, Use::W]);
-                }
-            }
-            StatementT::Assign(lhs, rhs) => {
-                for (k, mut us) in rhs.uses() {
-                    res.entry(k.to_string()).or_default().append(&mut us);
-                }
-                res.entry(lhs.to_string())
-                    .or_insert_with(Set::new)
-                    .insert(Use::W);
-            }
-            StatementT::Return(rhs) => {
-                for (k, mut us) in rhs.uses() {
-                    res.entry(k.to_string()).or_default().append(&mut us);
-                }
-            }
-            StatementT::Call(call) => {
-                if let ExpressionT::Call(fun, args) = &call.data {
-                    res.entry(fun.to_string())
-                        .or_default()
-                        .insert(Use::CallP(args.len()));
-                    for arg in args {
-                        for var in arg.variables() {
-                            res.entry(var.to_string()).or_default().insert(Use::R);
-                        }
-                    }
-                }
-            }
-            StatementT::Initial(blk) | StatementT::Block(blk) => {
-                let locals = blk
-                    .locals
-                    .iter()
-                    .map(|s| s.name.to_string())
-                    .collect::<Set<_>>();
-                for (k, mut vs) in blk.uses().into_iter() {
-                    if locals.contains(&k) {
-                        continue;
-                    }
-                    res.entry(k).or_default().append(&mut vs);
-                }
-            }
-            StatementT::Conserve(l, r) => {
-                for var in l.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                    res.entry(var.to_string()).or_default().insert(Use::W);
-                }
-                for var in r.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                    res.entry(var.to_string()).or_default().insert(Use::W);
-                }
-            }
-            StatementT::Rate(l, r, f, b) => {
-                for var in l.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                    res.entry(var.to_string()).or_default().insert(Use::W);
-                }
-                for var in r.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                    res.entry(var.to_string()).or_default().insert(Use::W);
-                }
-                for var in f.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                }
-                for var in b.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                }
-            }
-            StatementT::Derivative(nm, ex) => {
-                res.entry(format!("{nm}'")).or_default().insert(Use::R);
-                res.entry(format!("{nm}'")).or_default().insert(Use::W);
-                for var in ex.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                }
-            }
-            StatementT::IfThenElse(c, t, e) => {
-                for var in c.variables() {
-                    res.entry(var.to_string()).or_default().insert(Use::R);
-                }
-                res.append(&mut t.uses());
-                if let Some(o) = e {
-                    res.append(&mut o.uses());
-                }
-            }
-            StatementT::Solve(blk, _) => {
-                res.entry(blk.to_string()).or_default().insert(Use::Solve);
-            }
-        }
-        res
-    }
-
-    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res: Map<_, Vec<_>> = Map::new();
-        match &self.data {
-            StatementT::Linear(lhs, rhs) => {
-                for v in lhs
-                    .variables()
-                    .into_iter()
-                    .chain(rhs.variables().into_iter())
-                {
-                    res.entry(v.to_string())
-                        .or_default()
-                        .extend([(Use::R, self.loc), (Use::W, self.loc)]);
-                }
-            }
-            StatementT::Assign(lhs, rhs) => {
-                for (k, mut us) in rhs.use_timeline() {
-                    res.entry(k.to_string()).or_default().append(&mut us);
-                }
-                res.entry(lhs.to_string())
-                    .or_default()
-                    .push((Use::W, self.loc));
-            }
-            StatementT::Return(rhs) => {
-                for (k, mut us) in rhs.use_timeline() {
-                    res.entry(k.to_string()).or_default().append(&mut us);
-                }
-            }
-            StatementT::Call(call) => {
-                if let ExpressionT::Call(fun, args) = &call.data {
-                    res.entry(fun.to_string())
-                        .or_default()
-                        .push((Use::CallP(args.len()), self.loc));
-                    for arg in args {
-                        for var in arg.variables() {
-                            res.entry(var.to_string())
-                                .or_default()
-                                .push((Use::R, self.loc));
-                        }
-                    }
-                }
-            }
-            StatementT::Initial(blk) | StatementT::Block(blk) => {
-                let locals = blk
-                    .locals
-                    .iter()
-                    .map(|s| s.name.to_string())
-                    .collect::<Set<_>>();
-                for (k, mut vs) in blk.use_timeline().into_iter() {
-                    if locals.contains(&k) {
-                        continue;
-                    }
-                    res.entry(k).or_default().append(&mut vs);
-                }
-            }
-            StatementT::Conserve(l, r) => {
-                for var in l.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::W, self.loc));
-                }
-                for var in r.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::W, self.loc));
-                }
-            }
-            StatementT::Rate(l, r, f, b) => {
-                for var in l.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::W, self.loc));
-                }
-                for var in r.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::W, self.loc));
-                }
-                for var in f.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                }
-                for var in b.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                }
-            }
-            StatementT::Derivative(nm, ex) => {
-                res.entry(format!("{nm}'"))
-                    .or_default()
-                    .push((Use::R, self.loc));
-                res.entry(format!("{nm}'"))
-                    .or_default()
-                    .push((Use::W, self.loc));
-                for var in ex.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                }
-            }
-            StatementT::IfThenElse(c, t, e) => {
-                for var in c.variables() {
-                    res.entry(var.to_string())
-                        .or_default()
-                        .push((Use::R, self.loc));
-                }
-                let ls = t.use_timeline();
-                let rs = if let Some(o) = e {
-                    o.use_timeline()
-                } else {
-                    Default::default()
-                };
-                for (k, mut l) in ls.into_iter() {
-                    let r = if let Some(r) = rs.get(&k) {
-                        r.clone()
-                    } else {
-                        Default::default()
-                    };
-                    if l == r {
-                        res.entry(k).or_default().append(&mut l);
-                    } else {
-                        res.entry(k).or_default().push((Use::Unknown, self.loc));
-                    }
-                }
-            }
-            StatementT::Solve(blk, _) => {
-                res.entry(blk.to_string())
-                    .or_default()
-                    .push((Use::Solve, self.loc));
-            }
-        }
-        res
     }
 
     pub fn substitute(&self, from: &ExpressionT, to: &ExpressionT) -> Result<Self> {
@@ -582,7 +295,6 @@ impl Statement {
                 *fwd = fwd.substitute(from, to)?;
                 *bwd = bwd.substitute(from, to)?;
             }
-            StatementT::Solve(_, _) => {}
         }
         Ok(res)
     }
@@ -596,19 +308,245 @@ impl Statement {
             Ok(self.clone())
         }
     }
+
+    pub fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
+        use StatementT::*;
+        let res = match &self.data {
+            Assign(lhs, rhs) => {
+                let lhs = if let Some(lhs) = lut.get(lhs) {
+                    lhs.to_string()
+                } else {
+                    lhs.to_string()
+                };
+                let rhs = rhs.rename_all(lut)?;
+                Self::assign(&lhs, rhs, self.loc)
+            },
+            Return(_) => todo!(),
+            Conserve(lhs, rhs) => Self::conserve(lhs.rename_all(lut)?, rhs.rename_all(lut)?, self.loc),
+            Rate(a, b, c, d) => Self::rate(a.rename_all(lut)?,
+                                           b.rename_all(lut)?,
+                                           c.rename_all(lut)?,
+                                           d.rename_all(lut)?,
+                                           self.loc),
+            Linear(lhs, rhs) => Self::linear(lhs.rename_all(lut)?, rhs.rename_all(lut)?, self.loc),
+            Derivative(lhs, rhs) => {
+                let lhs = if let Some(lhs) = lut.get(lhs) {
+                    lhs.to_string()
+                } else {
+                    lhs.to_string()
+                };
+                let rhs = rhs.rename_all(lut)?;
+                Self::derivative(&lhs, rhs, self.loc)
+            },
+            IfThenElse(c, t, None) => Self::if_then_else(c.rename_all(lut)?,
+                                                      t.rename_all(lut)?,
+                                                      None,
+                                                      self.loc),
+            IfThenElse(c, t, Some(e)) => Self::if_then_else(c.rename_all(lut)?,
+                                                      t.rename_all(lut)?,
+                                                      Some(e.rename_all(lut)?),
+                                                      self.loc),
+            Block(blk) => Self::block(blk.rename_all(lut)?),
+            Call(Expression {data: ExpressionT::Call(nm, args), loc}) => {
+                let nm = if let Some(nm) = lut.get(nm) {
+                    nm
+                } else {
+                    nm
+                };
+                let args = args.iter().map(|a| a.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+                Self::call(nm, args, *loc)
+            }
+            Initial(blk) => Self::initial(blk.rename_all(lut)?, self.loc),
+            _ => unreachable!()
+        };
+        Ok(res)
+    }
 }
+
+impl Uses for Statement {
+    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
+        let mut res: Map<_, Vec<_>> = Map::new();
+        match &self.data {
+            StatementT::Linear(lhs, rhs) => {
+                for v in lhs
+                    .variables()
+                    .into_iter()
+                    .chain(rhs.variables().into_iter())
+                {
+                    res.entry(v.to_string())
+                       .or_default()
+                       .extend([(Use::R, self.loc), (Use::W, self.loc)]);
+                }
+            }
+            StatementT::Assign(lhs, rhs) => {
+                for (k, mut us) in rhs.uses_timeline() {
+                    res.entry(k.to_string()).or_default().append(&mut us);
+                }
+                res.entry(lhs.to_string())
+                   .or_default()
+                   .push((Use::W, self.loc));
+            }
+            StatementT::Return(rhs) => {
+                for (k, mut us) in rhs.uses_timeline() {
+                    res.entry(k.to_string()).or_default().append(&mut us);
+                }
+            }
+            StatementT::Call(call) => {
+                if let ExpressionT::Call(fun, args) = &call.data {
+                    res.entry(fun.to_string())
+                       .or_default()
+                       .push((Use::CallP(args.len()), self.loc));
+                    for arg in args {
+                        for var in arg.variables() {
+                            res.entry(var.to_string())
+                               .or_default()
+                               .push((Use::R, self.loc));
+                        }
+                    }
+                }
+            }
+            StatementT::Initial(blk) | StatementT::Block(blk) => {
+                let locals = blk
+                    .locals
+                    .iter()
+                    .map(|s| s.name.to_string())
+                    .collect::<Set<_>>();
+                for (k, mut vs) in blk.uses_timeline().into_iter() {
+                    if locals.contains(&k) {
+                        continue;
+                    }
+                    res.entry(k).or_default().append(&mut vs);
+                }
+            }
+            StatementT::Conserve(l, r) => {
+                for var in l.variables() {
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::W, self.loc));
+                }
+                for var in r.variables() {
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::W, self.loc));
+                }
+            }
+            StatementT::Rate(l, r, f, b) => {
+                for var in l.variables() {
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::W, self.loc));
+                }
+                for var in r.variables() {
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::R, self.loc));
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::W, self.loc));
+                }
+                for var in f.variables() {
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::R, self.loc));
+                }
+                for var in b.variables() {
+                    res.entry(var.to_string())
+                       .or_default()
+                       .push((Use::R, self.loc));
+                }
+            }
+            StatementT::Derivative(nm, ex) => {
+                for (v, ref mut u) in ex.uses_timeline().into_iter() {
+                    res.entry(v)
+                       .or_default()
+                       .append(u);
+                }
+                res.entry(format!("{nm}'"))
+                   .or_default()
+                   .push((Use::W, self.loc));
+            }
+            StatementT::IfThenElse(c, t, e) => {
+                for (var, us) in c.uses_timeline().iter_mut() {
+                    res.entry(var.to_string()).or_default().append(us);
+                }
+                let ls = t.uses_timeline();
+                let rs = if let Some(o) = e {
+                    o.uses_timeline()
+                } else {
+                    Default::default()
+                };
+                for key in ls.keys().chain(rs.keys()) {
+                    let entry = res.entry(key.to_string()).or_default();
+                    if let Some(l) = ls.get(key) {
+                        if let Some(r) = rs.get(key) {
+                            // Both exist...
+                            // ...but they are identical:
+                            if l.iter().zip(r.iter()).all(|(p, q)| p.0 == q.0) {
+                                entry.extend(l.iter());
+                            }
+                            // ...but history is already muddled:
+                            else if l.iter().any(|p| p.0 == Use::Unknown) || r.iter().any(|p| p.0 == Use::Unknown) {
+                                entry.push((Use::Unknown, self.loc));
+                            }
+                            else {
+                                entry.push((Use::Unknown, self.loc));
+                            }
+                        } else {
+                            // left is the only thing
+                            entry.extend(l.iter());
+                        }
+                    } else {
+                        if let Some(r) = rs.get(key) {
+                            // right is the only thing
+                            entry.extend(r.iter());
+                        } else {
+                            unreachable!();
+                        }
+                    }
+                }
+            }
+        }
+        res
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Solver {
+pub enum SolveT {
     Default,
     Method(String),
     SteadyState(String),
 }
 
+pub type Solve = WithLocation<(String, SolveT)>;
+
+impl Solve {
+    pub fn solve_default(lhs: &str, loc: Location) -> Self {
+        Solve { data: (lhs.to_string(), SolveT::Default), loc }
+    }
+
+    pub fn solve(lhs: &str, m: &str, loc: Location) -> Self {
+        Solve { data: (lhs.to_string(), SolveT::Method(m.to_string())), loc }
+    }
+
+    pub fn steadystate(lhs: &str, m: &str, loc: Location) -> Self {
+        Solve { data: (lhs.to_string(), SolveT::SteadyState(m.to_string())), loc }
+    }
+}
+
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StatementT {
     Assign(String, Expression),
     Return(Expression),
-    Solve(String, Solver),
     Conserve(Expression, Expression),
     Rate(Expression, Expression, Expression, Expression),
     Linear(Expression, Expression),
@@ -695,56 +633,6 @@ impl Expression {
         res
     }
 
-    fn guses<T>(&self, on: &mut dyn FnMut(&mut T, Use, Location)) -> Map<String, T>
-    where
-        T: Default,
-    {
-        fn uses_<T>(
-            ex: &Expression,
-            res: &mut Map<String, T>,
-            on: &mut dyn FnMut(&mut T, Use, Location),
-        ) where
-            T: Default,
-        {
-            match &ex.data {
-                ExpressionT::Variable(v) => {
-                    on(res.entry(v.to_string()).or_default(), Use::R, ex.loc);
-                }
-                ExpressionT::String(_) | ExpressionT::Number(_) => {}
-                ExpressionT::Unary(_, e) => uses_(&e, res, on),
-                ExpressionT::Binary(l, _, r) => {
-                    uses_(&l, res, on);
-                    uses_(&r, res, on);
-                }
-                ExpressionT::Call(f, es) => {
-                    on(
-                        res.entry(f.to_string()).or_default(),
-                        Use::CallF(es.len()),
-                        ex.loc,
-                    );
-                    for e in es {
-                        uses_(&e, res, on);
-                    }
-                }
-            }
-        }
-        let mut res = Map::new();
-        uses_(&self, &mut res, on);
-        res
-    }
-
-    pub fn uses(&self) -> Map<String, Set<Use>> {
-        self.guses(&mut |set, us, _| {
-            set.insert(us);
-        })
-    }
-
-    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        self.guses(&mut |set, us, loc| {
-            set.push((us, loc));
-        })
-    }
-
     pub fn substitute(&self, from: &ExpressionT, to: &ExpressionT) -> Result<Self> {
         let mut res = self.clone();
         match res.data {
@@ -771,6 +659,56 @@ impl Expression {
             ExpressionT::Variable(_) | ExpressionT::Number(_) | ExpressionT::String(_) => {}
         }
         Ok(res)
+    }
+
+    pub fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
+        use ExpressionT::*;
+        let res = match &self.data {
+            Unary(op, ex) => Self::unary(*op, ex.rename_all(lut)?, self.loc),
+            Binary(lhs, op, rhs) => Self::binary(lhs.rename_all(lut)?,
+                                                 *op,
+                                                 rhs.rename_all(lut)?,
+                                                 self.loc),
+            Variable(v) => if let Some(v) = lut.get(v) {
+                Self::variable(v, self.loc)
+            } else {
+                self.clone()
+            }
+            Number(_) => self.clone(),
+            String(_) => self.clone(),
+            Call(fun, args) => {
+                let args = args.iter().map(|a| a.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+                let fun = lut.get(fun).unwrap_or(fun);
+                Self::call(fun, args, self.loc)
+            }
+        };
+        Ok(res)
+    }
+}
+
+impl Uses for Expression {
+    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
+        let mut res: Map<String, Vec<(Use, Location)>> = Map::new();
+        match &self.data {
+            ExpressionT::Variable(v) => {
+                res.entry(v.to_string()).or_default().push((Use::R, self.loc));
+            }
+            ExpressionT::String(_) | ExpressionT::Number(_) => {}
+            ExpressionT::Unary(_, e) => {
+                res.append(&mut e.uses_timeline());
+            }
+            ExpressionT::Binary(l, _, r) => {
+                res.append(&mut l.uses_timeline());
+                res.append(&mut r.uses_timeline());
+            }
+            ExpressionT::Call(f, es) => {
+                for e in es {
+                    res.append(&mut e.uses_timeline());
+                }
+                res.entry(f.to_string()).or_default().push((Use::CallF(es.len()), self.loc));
+            }
+        }
+        res
     }
 }
 
@@ -875,11 +813,23 @@ impl Symbol {
     pub fn local(name: &str, loc: Location) -> Self {
         Self::variable(name, None, None, None, Access::RW, loc)
     }
-}
 
-pub struct SymbolT {
-    pub name: String,
-    pub unit: Option<Unit>,
+    pub fn rename(&self, nm: &str) -> Self {
+        let mut new = self.clone();
+        new.name = nm.to_string();
+        new
+    }
+
+    pub fn rename_all(&self, new: &Map<String, String>) -> Result<Self> {
+        let res = if let Some(nm) = new.get(&self.name) {
+            let mut new = self.clone();
+            new.name = nm.to_string();
+            new
+        } else {
+            self.clone()
+        };
+        Ok(res)
+    }
 }
 
 pub type Symbol = WithLocation<VariableT>;
@@ -892,6 +842,7 @@ pub struct CallableT {
     pub args: Option<Vec<Symbol>>,
     pub unit: Option<Unit>,
     pub body: Block,
+    pub solves: Vec<Solve>,
 }
 
 pub type Callable = WithLocation<CallableT>;
@@ -910,29 +861,43 @@ impl Callable {
                 args: Some(args.to_vec()),
                 unit,
                 body,
+                solves: Vec::new(),
             },
             loc,
         )
     }
 
-    pub fn headless(name: &str, body: Block, loc: Location) -> Self {
+    pub fn headless(name: &str, body: Block, solves: &[Solve], loc: Location) -> Self {
         Callable::new(
             CallableT {
                 name: name.to_string(),
                 args: None,
                 unit: None,
                 body,
+                solves: solves.to_vec(),
             },
             loc,
         )
     }
 
-    pub fn initial(body: Block, loc: Location) -> Self {
-        Self::headless("INITIAL", body, loc)
+    pub fn initial(body: Block, solves: &[Solve], loc: Location) -> Self {
+        Self::headless("INITIAL", body, solves, loc)
     }
 
-    pub fn breakpoint(body: Block, loc: Location) -> Self {
-        Self::headless("BREAKPOINT", body, loc)
+    pub fn breakpoint(body: Block, solves: &[Solve], loc: Location) -> Self {
+        Self::headless("BREAKPOINT", body, solves, loc)
+    }
+
+    pub fn kinetic(name: &str, body: Block, loc: Location) -> Self {
+        Self::headless(name, body, &[], loc)
+    }
+
+    pub fn linear(name: &str, body: Block, loc: Location) -> Self {
+        Self::headless(name, body, &[], loc)
+    }
+
+    pub fn derivative(name: &str, body: Block, loc: Location) -> Self {
+        Self::headless(name, body, &[], loc)
     }
 
     pub fn function(
@@ -948,14 +913,21 @@ impl Callable {
                 args: Some(args.to_vec()),
                 unit,
                 body,
+                solves: Vec::new(),
             },
             loc,
         )
     }
+}
 
-    pub fn uses(&self) -> Map<String, Set<Use>> {
-        let mut res = self.body.uses();
-        res.retain(|k, _| {
+impl Uses for Callable {
+    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
+        let mut res: Map<String, Vec<(Use, Location)>> = Map::new();
+        for solve in &self.solves {
+            res.entry(solve.data.0.to_string()).or_default().push((Use::Solve, solve.loc));
+        }
+        let mut bod = self.body.uses_timeline();
+        bod.retain(|k, _| {
             !self
                 .args
                 .as_deref()
@@ -963,25 +935,15 @@ impl Callable {
                 .iter()
                 .any(|a| &a.name == k)
         });
-        res
-    }
-
-    pub fn use_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res = self.body.use_timeline();
-        res.retain(|k, _| {
-            !self
-                .args
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|a| &a.name == k)
-        });
+        res.append(&mut bod);
         res
     }
 }
 
 #[cfg(test)]
 mod test {
+    use crate::{par::Parser, usr::Inventory};
+
     use super::*;
 
     #[test]
@@ -989,7 +951,7 @@ mod test {
         let loc = Location::default();
         let blk = Block::block(
             &[Symbol::local("a", loc), Symbol::local("b", loc)],
-            &[Statement::assign("a", Expression::number("42", loc), loc)],
+            &[Statement::assign("a", Expression::number("42", loc), loc),],
             loc,
         );
         let res = blk.splat_blocks().unwrap();
@@ -1042,6 +1004,35 @@ mod test {
                 Statement::assign("a", Expression::number("42", loc), loc)
             ],
         );
+
+        let blk = Block::block(
+            &[Symbol::local("a", loc), Symbol::local("b", loc)],
+            &[Statement::assign("a", Expression::number("42", loc), loc),
+              Statement::block(Block::block(
+                  &[Symbol::local("a", loc), Symbol::local("b", loc)],
+                  &[Statement::assign("b", Expression::number("42", loc), loc)],
+                  loc,
+              ))],
+            loc,
+        );
+
+        let res = blk.splat_blocks().unwrap();
+        assert_eq!(
+            res.locals,
+            vec![
+                Symbol::local("a", loc),
+                Symbol::local("b", loc),
+                Symbol::local("a_0", loc),
+                Symbol::local("b_0", loc),
+            ],
+        );
+        assert_eq!(
+            res.stmnts,
+            vec![
+                Statement::assign("a", Expression::number("42", loc), loc),
+                Statement::assign("b_0", Expression::number("42", loc), loc),
+            ],
+        );
     }
 
     #[test]
@@ -1060,6 +1051,26 @@ mod test {
             loc,
         );
         let res = blk.uses();
-        println!("{:?}", res);
+        assert_eq!(Some(&Set::from_iter([Use::CallP(0)].iter().cloned())), res.get("bar"));
+        assert_eq!(Some(&Set::from_iter([Use::CallF(1)].iter().cloned())), res.get("foo"));
+
+        let s = Parser::new_from_str("
+if (v > 0) {
+  x = y
+  a = 42
+} else {
+  x = z + a
+}").statement().unwrap();
+
+        let mut expected = Inventory::new();
+
+        expected.entry("x".to_string()).or_default().insert(Use::W);
+        expected.entry("y".to_string()).or_default().insert(Use::R);
+        expected.entry("z".to_string()).or_default().insert(Use::R);
+        expected.entry("v".to_string()).or_default().insert(Use::R);
+        expected.entry("a".to_string()).or_default().insert(Use::Unknown);
+
+        assert_eq!(s.uses(),
+                   expected);
     }
 }

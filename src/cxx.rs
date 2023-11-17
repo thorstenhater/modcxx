@@ -19,7 +19,6 @@ impl ToCxxDef for Statement {
         match &self.data {
             crate::exp::StatementT::Assign(n, e) => format!("{:ind$}{n} = {}", "", e.def(0)),
             crate::exp::StatementT::Return(_) => todo!(),
-            crate::exp::StatementT::Solve(_, _) => todo!(),
             crate::exp::StatementT::Conserve(_, _) => todo!(),
             crate::exp::StatementT::Rate(_, _, _, _) => todo!(),
             crate::exp::StatementT::Derivative(_, _) => todo!(),

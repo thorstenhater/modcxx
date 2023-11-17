@@ -2,8 +2,8 @@ use crate::{
     ast::Module,
     err::{ModcxxError, Result},
     exp::{
-        Access, Block, Callable, Expression, ExpressionT, Operator, Solver, Statement, StatementT,
-        Symbol, Unit, Variable,
+        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT,
+        Symbol, Unit, Variable, Solve, SolveT,
     },
     par::Kind,
 };
@@ -264,7 +264,7 @@ fn precedence_of(out: Operator) -> usize {
         Add | Sub => 30,
         Neg | Mul | Div => 40,
         Pow => 50,
-        _ => todo!()
+        _ => todo!(),
     }
 }
 
@@ -369,15 +369,6 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
                 ));
             }
         }
-        StatementT::Solve(d, m) => {
-            let ln = match m {
-                Solver::Default => format!("{:ind$}SOLVE {}", "", d),
-                Solver::Method(m) => format!("{:ind$}SOLVE {} METHOD {}", "", d, m),
-                Solver::SteadyState(m) => format!("{:ind$}SOLVE {} STEADYSTATE {}", "", d, m),
-            };
-            res.push(ln);
-            res.push(String::new());
-        }
         StatementT::Conserve(l, r) => {
             res.push(format!(
                 "{:ind$}CONSERVE {} = {}",
@@ -389,6 +380,15 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
         StatementT::Initial(_) => unreachable!(), // This must be removed/rewritten before!
     }
     Ok(res.join("\n"))
+}
+
+fn solve(it: &Solve, ind: usize) -> Result<String> {
+    let res = match &it.data {
+        (d, SolveT::Default) => format!("{:ind$}SOLVE {}", "", d),
+        (d, SolveT::Method(m)) => format!("{:ind$}SOLVE {} METHOD {}", "", d, m),
+        (d, SolveT::SteadyState(m)) => format!("{:ind$}SOLVE {} STEADYSTATE {}", "", d, m),
+    };
+    Ok(res)
 }
 
 fn initial(proc: &Callable) -> Result<String> {
@@ -469,7 +469,7 @@ fn function(proc: &Callable) -> Result<String> {
     ))
 }
 
-fn block(block: &Block, ind: usize, func: Option<&str>) -> Result<String> {
+pub fn block(block: &Block, ind: usize, func: Option<&str>) -> Result<String> {
     let mut res = Vec::new();
     res.push(format!("{:ind$}{{", ""));
     if !block.locals.is_empty() {
@@ -495,7 +495,7 @@ fn breakpoint(proc: &Callable) -> Result<String> {
     Ok(format!("BREAKPOINT {}", block(&proc.body, 0, None)?))
 }
 
-fn derivative(proc: &Callable) -> Result<String> {
+pub fn derivative(proc: &Callable) -> Result<String> {
     Ok(format!(
         "DERIVATIVE {} {}",
         proc.name,

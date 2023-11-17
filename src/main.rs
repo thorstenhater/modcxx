@@ -33,8 +33,7 @@ fn main() -> Result<()> {
                 ModcxxError::InternalError(format!("Could not open input file {}", &from))
             })?;
             let src = modcxx::par::parse(&raw)?;
-            let mut new = modcxx::ast::Module::new(&src)?
-                ;
+            let mut new = modcxx::ast::Module::new(&src)?;
             loop {
                 let nxt = new
                     .clone()

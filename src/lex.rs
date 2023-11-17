@@ -1,7 +1,7 @@
 use std::iter::Peekable;
 use std::str::Chars;
 
-use crate::src::{Code, Location};
+use crate::{src::Code, loc::Location};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Type {

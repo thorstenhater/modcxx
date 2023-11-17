@@ -1,5 +1,7 @@
-use crate::lex::Type;
-use crate::src::Location;
+use crate::{
+    lex::Type,
+    loc::Location
+};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ModcxxError>;
@@ -40,12 +42,14 @@ pub enum ModcxxError {
     CallableNotSolvable(String, Location),
     #[error("Symbol {0} is callable, used in SOLVE here {1:?}.")]
     VariableNotCallable(String, Location),
+    #[error("Symbol {0} is variable, used in SOLVE here {1:?}.")]
+    VariableNotSolvable(String, Location),
     #[error("Symbol {0} is solvable, used as a variable here {1:?}.")]
     SolvableNotVariable(String, Location),
     #[error("Symbol {0} is solvable, used as a callable here {1:?}.")]
     SolvableNotCallable(String, Location),
-    #[error("ASSIGNED {0} may be used unintialised in block {1}.")]
-    UninitialisedAssigned(String, String),
+    #[error("ASSIGNED {0} may be used unintialised here {1:?}.")]
+    UninitialisedAssigned(String, Location),
     #[error("Function/Procedure {0} expects {1} arguments, given {2} here {3:?}.")]
     WrongArity(String, usize, usize, Location),
     #[error("KINETIC block switched from reaction (~ A <-> B ...) to a normal statement here {0:?}. This is likely illformed and not what you intend.")]

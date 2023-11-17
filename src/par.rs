@@ -1,10 +1,12 @@
 use crate::err::{ModcxxError, Result};
 use crate::lex::{Lexer, Token, Type};
-use crate::src::{Code, Location};
+use crate::src::Code;
+use crate::loc::Location;
 
 use crate::exp::{
+    self,
     Block, Callable, Expression, ExpressionT, Independent, Operator, Statement, StatementT, Symbol,
-    Unit, Variable,
+    Unit, Variable, Solve,
 };
 
 use crate::Set;
@@ -458,29 +460,29 @@ impl Parser {
 
     fn initial(&mut self) -> Result<Callable> {
         let init = self.expect(Type::Initial)?;
-        let body = self.block()?;
-        Ok(Callable::initial(body, init.loc))
+        let (slvs, body) = self.block_with_solve()?;
+        Ok(Callable::initial(body, &slvs, init.loc))
     }
 
     fn kinetic(&mut self) -> Result<Callable> {
         let ds = self.expect(Type::Kinetic)?;
         let id = self.expect(Type::Identifier)?;
         let body = self.block()?;
-        Ok(Callable::headless(&id.val.unwrap(), body, ds.loc))
+        Ok(Callable::kinetic(&id.val.unwrap(), body, ds.loc))
     }
 
     fn linear(&mut self) -> Result<Callable> {
         let ds = self.expect(Type::Linear)?;
         let id = self.expect(Type::Identifier)?;
         let body = self.block()?;
-        Ok(Callable::headless(&id.val.unwrap(), body, ds.loc))
+        Ok(Callable::linear(&id.val.unwrap(), body, ds.loc))
     }
 
-    fn derivative(&mut self) -> Result<Callable> {
+    pub fn derivative(&mut self) -> Result<Callable> {
         let ds = self.expect(Type::Derivative)?;
         let id = self.expect(Type::Identifier)?;
         let body = self.block()?;
-        Ok(Callable::headless(&id.val.unwrap(), body, ds.loc))
+        Ok(Callable::derivative(&id.val.unwrap(), body, ds.loc))
     }
 
     fn procedure(&mut self) -> Result<Callable> {
@@ -569,19 +571,46 @@ impl Parser {
         Ok(args)
     }
 
-    fn breakpoint(&mut self) -> Result<Callable> {
-        let blk = self.expect(Type::Breakpoint)?;
-        let body = self.block()?;
-        Ok(Callable::breakpoint(body, blk.loc))
+    fn solves(&mut self) -> Result<Vec<Solve>> {
+        use Type::*;
+        let mut res = Vec::new();
+        while self.lexer.peek().typ == Solve {
+            let loc = self.expect(Solve)?.loc;
+            let blk = self.expect(Identifier)?;
+            let slv = match self.matches_one_of(&[Method, SteadyState]).map(|t| t.typ) {
+                Some(Method) => exp::Solve::solve(
+                    &blk.val.unwrap(),
+                    &self.expect(Identifier)?.val.unwrap(),
+                    loc,
+                ),
+                Some(SteadyState) => exp::Solve::steadystate(
+                    &blk.val.unwrap(),
+                    &self.expect(Identifier)?.val.unwrap(),
+                    loc,
+                ),
+                None => exp::Solve::solve_default(&blk.val.unwrap(), loc),
+                _ => unreachable!(),
+            };
+            res.push(slv);
+        }
+        Ok(res)
     }
 
-    fn block(&mut self) -> Result<Block> {
+    fn breakpoint(&mut self) -> Result<Callable> {
+        let blk = self.expect(Type::Breakpoint)?;
+        let (slvs, body) = self.block_with_solve()?;
+        Ok(Callable::breakpoint(body, &slvs, blk.loc))
+    }
+
+    pub fn block_with_solve(&mut self) -> Result<(Vec<Solve>, Block)> {
         use Type::*;
         let beg = self.expect(LeftBrace)?.loc;
-        let locals = self.locals()?;
+        let slvs = self.solves()?;
+        let mut locals = self.locals()?;
         let mut stmnts = Vec::new();
         loop {
-            match self.lexer.peek().typ {
+            let tok = self.lexer.peek();
+            match tok.typ {
                 RightBrace => break,
                 UnitsOn | UnitsOff => {
                     self.skip();
@@ -601,9 +630,61 @@ impl Parser {
                         }
                     }
                 }
+                Local => {
+                    // TODO this is a hack and messes up scoping by allowing
+                    // variables beeing named before introduction.
+                    locals.append(&mut self.locals()?);
+                }
                 Verbatim => {
-                    self.expect(Verbatim)?;
-                    println!("IGNORING VERBATIM, result might be broken.");
+                    return Err(ModcxxError::Unsupported(
+                        "VERBATIM".into(),
+                        self.lexer.code.mark_location(&tok.loc),
+                    ));
+                }
+                _ => stmnts.push(self.statement()?),
+            }
+        }
+        self.expect(RightBrace)?;
+        Ok((slvs, Block::block(&locals, &stmnts, beg)))
+    }
+
+    pub fn block(&mut self) -> Result<Block> {
+        use Type::*;
+        let beg = self.expect(LeftBrace)?.loc;
+        let mut locals = self.locals()?;
+        let mut stmnts = Vec::new();
+        loop {
+            let tok = self.lexer.peek();
+            match tok.typ {
+                RightBrace => break,
+                UnitsOn | UnitsOff => {
+                    self.skip();
+                    continue;
+                }
+                Table => {
+                    self.skip();
+                    self.list_of()?;
+                    if self.matches(Depend).is_some() {
+                        self.list_of()?;
+                    }
+                    while self.matches_one_of(&[From, To, With]).is_some() {
+                        if self.lexer.peek().typ == Identifier {
+                            self.skip();
+                        } else {
+                            self.number()?;
+                        }
+                    }
+                }
+                Local => {
+                    // TODO this is a hack and messes up scoping by allowing
+                    // variables beeing named before introduction.
+                    locals.append(&mut self.locals()?);
+                }
+                Verbatim => {
+                    return Err(ModcxxError::Unsupported(
+                        "VERBATIM".into(),
+                        self.lexer.code.mark_location(&tok.loc),
+                    ));
                 }
                 _ => stmnts.push(self.statement()?),
             }
@@ -624,7 +705,7 @@ impl Parser {
         }
     }
 
-    fn statement(&mut self) -> Result<Statement> {
+    pub fn statement(&mut self) -> Result<Statement> {
         use Type::*;
         match self.lexer.peek().typ {
             If => {
@@ -645,25 +726,6 @@ impl Parser {
                     None
                 };
                 Ok(Statement::if_then_else(cond, then, neht, loc))
-            }
-            Solve => {
-                let loc = self.expect(Solve)?.loc;
-                let blk = self.expect(Identifier)?;
-                let res = match self.matches_one_of(&[Method, SteadyState]).map(|t| t.typ) {
-                    Some(Method) => Statement::solve(
-                        &blk.val.unwrap(),
-                        &self.expect(Identifier)?.val.unwrap(),
-                        loc,
-                    ),
-                    Some(SteadyState) => Statement::steadystate(
-                        &blk.val.unwrap(),
-                        &self.expect(Identifier)?.val.unwrap(),
-                        loc,
-                    ),
-                    None => Statement::solve_default(&blk.val.unwrap(), loc),
-                    _ => unreachable!(),
-                };
-                Ok(res)
             }
             Identifier => {
                 let id = self.expect(Identifier)?;
@@ -902,9 +964,14 @@ impl Parser {
     fn unit(&mut self) -> Result<Option<Unit>> {
         use Type::*;
         if self.matches(LeftParen).is_some() {
-            let res = self.unit_factor()?;
-            self.expect(RightParen)?;
-            Ok(Some(res))
+            if self.lexer.peek().typ == RightParen {
+                self.expect(RightParen)?;
+                Ok(None)
+            } else {
+                let res = self.unit_factor()?;
+                self.expect(RightParen)?;
+                Ok(Some(res))
+            }
         } else {
             Ok(None)
         }
@@ -984,6 +1051,25 @@ pub fn parse(input: &str) -> Result<Module> {
 mod test {
     use super::*;
 
+    #[test]
+    fn fabs() {
+        println!(
+            "{:?}",
+            Parser::new_from_str("fabs(x)").expression().unwrap()
+        );
+
+        println!(
+            "{:?}",
+            Parser::new_from_str("fabs(-x)^2").expression().unwrap()
+        );
+
+        println!(
+            "{:?}",
+            Parser::new_from_str("if (fabs(x / y) < 1e-6) {}")
+                .statement()
+                .unwrap()
+        );
+    }
     #[test]
     fn nrn1() {
         fn check(m: &str, line: usize, column: usize, position: usize) {

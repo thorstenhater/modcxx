@@ -15,7 +15,6 @@ FUNCTION foo(x, y) {
 
     let raw = modcxx::par::parse(src).expect("No parse");
     let new = modcxx::ast::Module::new(&raw);
-    eprintln!("{new:?}");
     assert!(matches!(new, Err(modcxx::err::ModcxxError::UnboundName(s, _)) if s == "z"));
     let src = r#"
 NEURON {
@@ -52,7 +51,6 @@ PROCEDURE foo(x, y) {
 
     let raw = modcxx::par::parse(src).expect("No parse");
     let new = modcxx::ast::Module::new(&raw);
-    eprintln!("{new:?}");
     assert!(new.is_ok());
 
     let src = r#"
@@ -72,7 +70,6 @@ PROCEDURE foo(x, y) {
 
     let raw = modcxx::par::parse(src).expect("No parse");
     let new = modcxx::ast::Module::new(&raw);
-    eprintln!("{new:?}");
     assert!(new.is_ok());
 }
 
@@ -137,6 +134,5 @@ baz(23)}
 
     let raw = modcxx::par::parse(src).expect("No parse");
     let new = modcxx::ast::Module::new(&raw);
-    eprintln!("{new:?}");
     assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
 }
