@@ -1,7 +1,8 @@
 use std::fmt::{self, Debug};
 use std::ops::{Deref, DerefMut};
 
-use crate::{err::Result, loc::Location, Map, Set, usr::{Use, Uses}};
+use crate::usr::{Inventory, self};
+use crate::{err::Result, loc::Location, Map, Set, usr::Uses};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WithLocation<T: Clone + PartialEq + Eq + Debug> {
@@ -185,18 +186,15 @@ impl Block {
 }
 
 impl Uses for Block {
-    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res: Map<_, Vec<_>> = Map::new();
-        let locals = self
-            .locals
-            .iter()
-            .map(|s| s.name.to_string())
-            .collect::<Set<_>>();
+    fn uses(&self) -> Inventory {
+        let mut res = Inventory::new();
         for stmnt in &self.stmnts {
-            for (k, mut vs) in stmnt.uses_timeline().into_iter() {
-                if !locals.contains(&k) {
-                    res.entry(k).or_default().append(&mut vs);
-                }
+            res.merge(&stmnt.uses());
+        }
+        for local in &self.locals {
+            if let Some(e) = res.0.get_mut(&local.name) {
+                e.writes.iter_mut().for_each(|e| e.kind = usr::Kind::Local);
+                e.reads.iter_mut().for_each(|e| e.kind = usr::Kind::Local);
             }
         }
         res
@@ -206,16 +204,28 @@ impl Uses for Block {
 pub type Statement = WithLocation<StatementT>;
 
 impl Statement {
+    pub fn solve_default(lhs: &str, loc: Location) -> Self {
+        Self::new(StatementT::Solve(lhs.to_string(), SolveT::Default), loc)
+    }
+
+    pub fn solve(lhs: &str, m: &str, loc: Location) -> Self {
+        Self::new(StatementT::Solve(lhs.to_string(), SolveT::Method(m.to_string())), loc)
+    }
+
+    pub fn steadystate(lhs: &str, m: &str, loc: Location) -> Self {
+        Self::new(StatementT::Solve(lhs.to_string(), SolveT::SteadyState(m.to_string())), loc)
+    }
+
     pub fn assign(lhs: &str, rhs: Expression, loc: Location) -> Self {
-        Statement::new(StatementT::Assign(lhs.to_string(), rhs), loc)
+        Self::new(StatementT::Assign(lhs.to_string(), rhs), loc)
     }
 
     pub fn initial(block: Block, loc: Location) -> Self {
-        Statement::new(StatementT::Initial(block), loc)
+        Self::new(StatementT::Initial(block), loc)
     }
 
     pub fn conserve(lhs: Expression, rhs: Expression, loc: Location) -> Self {
-        Statement::new(StatementT::Conserve(lhs, rhs), loc)
+        Self::new(StatementT::Conserve(lhs, rhs), loc)
     }
 
     pub fn rate(
@@ -295,6 +305,7 @@ impl Statement {
                 *fwd = fwd.substitute(from, to)?;
                 *bwd = bwd.substitute(from, to)?;
             }
+            StatementT::Solve(_, _) => {}
         }
         Ok(res)
     }
@@ -364,156 +375,91 @@ impl Statement {
 }
 
 impl Uses for Statement {
-    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res: Map<_, Vec<_>> = Map::new();
+    fn uses(&self) -> Inventory {
+        let mut res = Inventory::new();
+        let entry = usr::Use { args: 0, src: self.loc, kind: usr::Kind::Global };
         match &self.data {
             StatementT::Linear(lhs, rhs) => {
-                for v in lhs
-                    .variables()
-                    .into_iter()
-                    .chain(rhs.variables().into_iter())
-                {
-                    res.entry(v.to_string())
-                       .or_default()
-                       .extend([(Use::R, self.loc), (Use::W, self.loc)]);
+                for v in rhs.variables().into_iter() {
+                    res.0.entry(v).or_default().reads.push(entry);
+                }
+                for v in lhs.variables().into_iter() {
+                    res.0.entry(v).or_default().writes.push(entry);
                 }
             }
             StatementT::Assign(lhs, rhs) => {
-                for (k, mut us) in rhs.uses_timeline() {
-                    res.entry(k.to_string()).or_default().append(&mut us);
+                for (k, v) in rhs.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
                 }
-                res.entry(lhs.to_string())
-                   .or_default()
-                   .push((Use::W, self.loc));
+                res.0.entry(lhs.to_string()).or_default().writes.push(entry);
             }
             StatementT::Return(rhs) => {
-                for (k, mut us) in rhs.uses_timeline() {
-                    res.entry(k.to_string()).or_default().append(&mut us);
+                for (k, v) in rhs.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
                 }
             }
             StatementT::Call(call) => {
-                if let ExpressionT::Call(fun, args) = &call.data {
-                    res.entry(fun.to_string())
-                       .or_default()
-                       .push((Use::CallP(args.len()), self.loc));
-                    for arg in args {
-                        for var in arg.variables() {
-                            res.entry(var.to_string())
-                               .or_default()
-                               .push((Use::R, self.loc));
-                        }
-                    }
+                for (k, v) in call.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
                 }
             }
             StatementT::Initial(blk) | StatementT::Block(blk) => {
-                let locals = blk
-                    .locals
-                    .iter()
-                    .map(|s| s.name.to_string())
-                    .collect::<Set<_>>();
-                for (k, mut vs) in blk.uses_timeline().into_iter() {
-                    if locals.contains(&k) {
-                        continue;
-                    }
-                    res.entry(k).or_default().append(&mut vs);
+                for (k, v) in blk.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
                 }
             }
             StatementT::Conserve(l, r) => {
-                for var in l.variables() {
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::W, self.loc));
+                for var in l.variables().into_iter() {
+                    let e = res.0.entry(var).or_default();
+                    e.reads.push(entry);
+                    e.writes.push(entry);
                 }
-                for var in r.variables() {
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::W, self.loc));
+                for var in r.variables().into_iter() {
+                    let e = res.0.entry(var).or_default();
+                    e.reads.push(entry);
+                    e.writes.push(entry);
                 }
             }
             StatementT::Rate(l, r, f, b) => {
                 for var in l.variables() {
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::W, self.loc));
+                    let e = res.0.entry(var).or_default();
+                    e.reads.push(entry);
+                    e.writes.push(entry);
                 }
-                for var in r.variables() {
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::R, self.loc));
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::W, self.loc));
+                for var in r.variables().into_iter() {
+                    let e = res.0.entry(var).or_default();
+                    e.reads.push(entry);
+                    e.writes.push(entry);
                 }
-                for var in f.variables() {
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::R, self.loc));
+                for var in f.variables().into_iter() {
+                    res.0.entry(var).or_default().reads.push(entry);
                 }
-                for var in b.variables() {
-                    res.entry(var.to_string())
-                       .or_default()
-                       .push((Use::R, self.loc));
+                for var in b.variables().into_iter() {
+                    res.0.entry(var).or_default().reads.push(entry);
                 }
             }
             StatementT::Derivative(nm, ex) => {
-                for (v, ref mut u) in ex.uses_timeline().into_iter() {
-                    res.entry(v)
-                       .or_default()
-                       .append(u);
+                for (k, v) in ex.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
                 }
-                res.entry(format!("{nm}'"))
-                   .or_default()
-                   .push((Use::W, self.loc));
+                res.0.entry(format!("{nm}'")).or_default().writes.push(entry);
             }
             StatementT::IfThenElse(c, t, e) => {
-                for (var, us) in c.uses_timeline().iter_mut() {
-                    res.entry(var.to_string()).or_default().append(us);
+                for (k, v) in c.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
                 }
-                let ls = t.uses_timeline();
-                let rs = if let Some(o) = e {
-                    o.uses_timeline()
-                } else {
-                    Default::default()
-                };
-                for key in ls.keys().chain(rs.keys()) {
-                    let entry = res.entry(key.to_string()).or_default();
-                    if let Some(l) = ls.get(key) {
-                        if let Some(r) = rs.get(key) {
-                            // Both exist...
-                            // ...but they are identical:
-                            if l.iter().zip(r.iter()).all(|(p, q)| p.0 == q.0) {
-                                entry.extend(l.iter());
-                            }
-                            // ...but history is already muddled:
-                            else if l.iter().any(|p| p.0 == Use::Unknown) || r.iter().any(|p| p.0 == Use::Unknown) {
-                                entry.push((Use::Unknown, self.loc));
-                            }
-                            else {
-                                entry.push((Use::Unknown, self.loc));
-                            }
-                        } else {
-                            // left is the only thing
-                            entry.extend(l.iter());
-                        }
-                    } else {
-                        if let Some(r) = rs.get(key) {
-                            // right is the only thing
-                            entry.extend(r.iter());
-                        } else {
-                            unreachable!();
-                        }
+                for (k, v) in t.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
+                }
+                if let Some(e) = e {
+                    for (k, v) in e.uses().into_iter() {
+                        res.0.entry(k).or_default().merge(&v);
                     }
                 }
             }
+            StatementT::Solve(what, _) => {
+                res.0.entry(what.to_string()).or_default().solves.push(entry);
+            },
         }
         res
     }
@@ -526,23 +472,6 @@ pub enum SolveT {
     SteadyState(String),
 }
 
-pub type Solve = WithLocation<(String, SolveT)>;
-
-impl Solve {
-    pub fn solve_default(lhs: &str, loc: Location) -> Self {
-        Solve { data: (lhs.to_string(), SolveT::Default), loc }
-    }
-
-    pub fn solve(lhs: &str, m: &str, loc: Location) -> Self {
-        Solve { data: (lhs.to_string(), SolveT::Method(m.to_string())), loc }
-    }
-
-    pub fn steadystate(lhs: &str, m: &str, loc: Location) -> Self {
-        Solve { data: (lhs.to_string(), SolveT::SteadyState(m.to_string())), loc }
-    }
-}
-
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StatementT {
     Assign(String, Expression),
@@ -553,6 +482,7 @@ pub enum StatementT {
     Derivative(String, Expression),
     IfThenElse(Expression, Block, Option<Block>),
     Block(Block),
+    Solve(String, SolveT),
     Call(Expression), // This feels redundant
     Initial(Block),   // This is _only_ ever for NET_RECEIVE... I hate NMODL
 }
@@ -687,25 +617,33 @@ impl Expression {
 }
 
 impl Uses for Expression {
-    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res: Map<String, Vec<(Use, Location)>> = Map::new();
+    fn uses(&self) -> Inventory {
+        let mut res = Inventory::new();
         match &self.data {
-            ExpressionT::Variable(v) => {
-                res.entry(v.to_string()).or_default().push((Use::R, self.loc));
-            }
+            ExpressionT::Variable(v) => res.0.entry(v.to_string()).or_default().reads.push(usr::Use { args: 0, src: self.loc, kind: usr::Kind::Global }),
             ExpressionT::String(_) | ExpressionT::Number(_) => {}
             ExpressionT::Unary(_, e) => {
-                res.append(&mut e.uses_timeline());
+                for (k, v) in e.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
+                }
             }
             ExpressionT::Binary(l, _, r) => {
-                res.append(&mut l.uses_timeline());
-                res.append(&mut r.uses_timeline());
+                for (k, v) in l.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
+                }
+                for (k, v) in r.uses().into_iter() {
+                    res.0.entry(k).or_default().merge(&v);
+                }
+
             }
+            // Calls evaluate args left -> right _then_ call the functions.
             ExpressionT::Call(f, es) => {
                 for e in es {
-                    res.append(&mut e.uses_timeline());
+                    for (k, v) in e.uses().into_iter() {
+                        res.0.entry(k).or_default().merge(&v);
+                    }
                 }
-                res.entry(f.to_string()).or_default().push((Use::CallF(es.len()), self.loc));
+                res.0.entry(f.to_string()).or_default().calls.push(usr::Use { args: es.len(), src: self.loc, kind: usr::Kind::Global });
             }
         }
         res
@@ -842,7 +780,6 @@ pub struct CallableT {
     pub args: Option<Vec<Symbol>>,
     pub unit: Option<Unit>,
     pub body: Block,
-    pub solves: Vec<Solve>,
 }
 
 pub type Callable = WithLocation<CallableT>;
@@ -861,43 +798,41 @@ impl Callable {
                 args: Some(args.to_vec()),
                 unit,
                 body,
-                solves: Vec::new(),
             },
             loc,
         )
     }
 
-    pub fn headless(name: &str, body: Block, solves: &[Solve], loc: Location) -> Self {
+    pub fn headless(name: &str, body: Block, loc: Location) -> Self {
         Callable::new(
             CallableT {
                 name: name.to_string(),
                 args: None,
                 unit: None,
                 body,
-                solves: solves.to_vec(),
             },
             loc,
         )
     }
 
-    pub fn initial(body: Block, solves: &[Solve], loc: Location) -> Self {
-        Self::headless("INITIAL", body, solves, loc)
+    pub fn initial(body: Block, loc: Location) -> Self {
+        Self::headless("INITIAL", body, loc)
     }
 
-    pub fn breakpoint(body: Block, solves: &[Solve], loc: Location) -> Self {
-        Self::headless("BREAKPOINT", body, solves, loc)
+    pub fn breakpoint(body: Block, loc: Location) -> Self {
+        Self::headless("BREAKPOINT", body, loc)
     }
 
     pub fn kinetic(name: &str, body: Block, loc: Location) -> Self {
-        Self::headless(name, body, &[], loc)
+        Self::headless(name, body, loc)
     }
 
     pub fn linear(name: &str, body: Block, loc: Location) -> Self {
-        Self::headless(name, body, &[], loc)
+        Self::headless(name, body, loc)
     }
 
     pub fn derivative(name: &str, body: Block, loc: Location) -> Self {
-        Self::headless(name, body, &[], loc)
+        Self::headless(name, body, loc)
     }
 
     pub fn function(
@@ -913,7 +848,6 @@ impl Callable {
                 args: Some(args.to_vec()),
                 unit,
                 body,
-                solves: Vec::new(),
             },
             loc,
         )
@@ -921,28 +855,23 @@ impl Callable {
 }
 
 impl Uses for Callable {
-    fn uses_timeline(&self) -> Map<String, Vec<(Use, Location)>> {
-        let mut res: Map<String, Vec<(Use, Location)>> = Map::new();
-        for solve in &self.solves {
-            res.entry(solve.data.0.to_string()).or_default().push((Use::Solve, solve.loc));
+    fn uses(&self) -> Inventory {
+        let mut res = self.body.uses();
+        if let Some(args) = &self.args {
+            for arg in args {
+                if let Some(e) = res.0.get_mut(&arg.name) {
+                    e.reads.iter_mut().for_each(|r| r.kind = usr::Kind::Argument);
+                    e.writes.iter_mut().for_each(|r| r.kind = usr::Kind::Argument);
+                }
+            }
         }
-        let mut bod = self.body.uses_timeline();
-        bod.retain(|k, _| {
-            !self
-                .args
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|a| &a.name == k)
-        });
-        res.append(&mut bod);
         res
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{par::Parser, usr::Inventory};
+    use crate::par::Parser;
 
     use super::*;
 
@@ -1051,8 +980,8 @@ mod test {
             loc,
         );
         let res = blk.uses();
-        assert_eq!(Some(&Set::from_iter([Use::CallP(0)].iter().cloned())), res.get("bar"));
-        assert_eq!(Some(&Set::from_iter([Use::CallF(1)].iter().cloned())), res.get("foo"));
+        assert!(res.is_called("foo").is_some());
+        assert!(res.is_called("bar").is_some());
 
         let s = Parser::new_from_str("
 if (v > 0) {
@@ -1062,15 +991,16 @@ if (v > 0) {
   x = z + a
 }").statement().unwrap();
 
-        let mut expected = Inventory::new();
+        eprintln!("{s:?}");
 
-        expected.entry("x".to_string()).or_default().insert(Use::W);
-        expected.entry("y".to_string()).or_default().insert(Use::R);
-        expected.entry("z".to_string()).or_default().insert(Use::R);
-        expected.entry("v".to_string()).or_default().insert(Use::R);
-        expected.entry("a".to_string()).or_default().insert(Use::Unknown);
-
-        assert_eq!(s.uses(),
-                   expected);
+        let res = s.uses();
+        assert!(res.is_read("v").is_some());
+        assert!(res.is_read("x").is_none());
+        assert!(res.is_read("y").is_some());
+        assert!(res.is_read("z").is_some());
+        assert!(res.is_written("y").is_none());
+        assert!(res.is_written("z").is_none());
+        assert!(res.is_written("a").is_some());
+        assert!(res.is_written("x").is_some());
     }
 }

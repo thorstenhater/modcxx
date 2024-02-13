@@ -3,7 +3,7 @@ use crate::{
     err::{ModcxxError, Result},
     exp::{
         Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT,
-        Symbol, Unit, Variable, Solve, SolveT,
+        Symbol, Unit, Variable, SolveT,
     },
     par::Kind,
 };
@@ -302,6 +302,14 @@ fn expression_with_precedence(ex: &Expression, out: Operator) -> Result<String> 
 fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String> {
     let mut res = Vec::new();
     match &stmnt.data {
+        StatementT::Solve(it, how) => {
+            let ln =match how {
+                SolveT::Default => format!("{:ind$}SOLVE {}", "", it),
+                SolveT::Method(m) => format!("{:ind$}SOLVE {} METHOD {}", "", it, m),
+                SolveT::SteadyState(m) => format!("{:ind$}SOLVE {} STEADYSTATE {}", "", it, m),
+            };
+            res.push(ln);
+        }
         StatementT::Linear(lhs, rhs) => res.push(format!(
             "{:ind$}~ {} = {}",
             "",
@@ -380,15 +388,6 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
         StatementT::Initial(_) => unreachable!(), // This must be removed/rewritten before!
     }
     Ok(res.join("\n"))
-}
-
-fn solve(it: &Solve, ind: usize) -> Result<String> {
-    let res = match &it.data {
-        (d, SolveT::Default) => format!("{:ind$}SOLVE {}", "", d),
-        (d, SolveT::Method(m)) => format!("{:ind$}SOLVE {} METHOD {}", "", d, m),
-        (d, SolveT::SteadyState(m)) => format!("{:ind$}SOLVE {} STEADYSTATE {}", "", d, m),
-    };
-    Ok(res)
 }
 
 fn initial(proc: &Callable) -> Result<String> {

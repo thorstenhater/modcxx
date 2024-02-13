@@ -6,7 +6,7 @@ use crate::loc::Location;
 use crate::exp::{
     self,
     Block, Callable, Expression, ExpressionT, Independent, Operator, Statement, StatementT, Symbol,
-    Unit, Variable, Solve,
+    Unit, Variable,
 };
 
 use crate::Set;
@@ -460,8 +460,8 @@ impl Parser {
 
     fn initial(&mut self) -> Result<Callable> {
         let init = self.expect(Type::Initial)?;
-        let (slvs, body) = self.block_with_solve()?;
-        Ok(Callable::initial(body, &slvs, init.loc))
+        let body = self.block()?;
+        Ok(Callable::initial(body, init.loc))
     }
 
     fn kinetic(&mut self) -> Result<Callable> {
@@ -571,81 +571,31 @@ impl Parser {
         Ok(args)
     }
 
-    fn solves(&mut self) -> Result<Vec<Solve>> {
+    fn solve(&mut self) -> Result<Statement> {
         use Type::*;
-        let mut res = Vec::new();
-        while self.lexer.peek().typ == Solve {
-            let loc = self.expect(Solve)?.loc;
-            let blk = self.expect(Identifier)?;
-            let slv = match self.matches_one_of(&[Method, SteadyState]).map(|t| t.typ) {
-                Some(Method) => exp::Solve::solve(
-                    &blk.val.unwrap(),
-                    &self.expect(Identifier)?.val.unwrap(),
-                    loc,
-                ),
-                Some(SteadyState) => exp::Solve::steadystate(
-                    &blk.val.unwrap(),
-                    &self.expect(Identifier)?.val.unwrap(),
-                    loc,
-                ),
-                None => exp::Solve::solve_default(&blk.val.unwrap(), loc),
-                _ => unreachable!(),
-            };
-            res.push(slv);
-        }
+        let loc = self.expect(Solve)?.loc;
+        let blk = self.expect(Identifier)?;
+        let res = match self.matches_one_of(&[Method, SteadyState]).map(|t| t.typ) {
+            Some(Method) => exp::Statement::solve(
+                &blk.val.unwrap(),
+                &self.expect(Identifier)?.val.unwrap(),
+                loc,
+            ),
+            Some(SteadyState) => exp::Statement::steadystate(
+                &blk.val.unwrap(),
+                &self.expect(Identifier)?.val.unwrap(),
+                loc,
+            ),
+            None => exp::Statement::solve_default(&blk.val.unwrap(), loc),
+            _ => unreachable!(),
+        };
         Ok(res)
     }
 
     fn breakpoint(&mut self) -> Result<Callable> {
         let blk = self.expect(Type::Breakpoint)?;
-        let (slvs, body) = self.block_with_solve()?;
-        Ok(Callable::breakpoint(body, &slvs, blk.loc))
-    }
-
-    pub fn block_with_solve(&mut self) -> Result<(Vec<Solve>, Block)> {
-        use Type::*;
-        let beg = self.expect(LeftBrace)?.loc;
-        let slvs = self.solves()?;
-        let mut locals = self.locals()?;
-        let mut stmnts = Vec::new();
-        loop {
-            let tok = self.lexer.peek();
-            match tok.typ {
-                RightBrace => break,
-                UnitsOn | UnitsOff => {
-                    self.skip();
-                    continue;
-                }
-                Table => {
-                    self.skip();
-                    self.list_of()?;
-                    if self.matches(Depend).is_some() {
-                        self.list_of()?;
-                    }
-                    while self.matches_one_of(&[From, To, With]).is_some() {
-                        if self.lexer.peek().typ == Identifier {
-                            self.skip();
-                        } else {
-                            self.number()?;
-                        }
-                    }
-                }
-                Local => {
-                    // TODO this is a hack and messes up scoping by allowing
-                    // variables beeing named before introduction.
-                    locals.append(&mut self.locals()?);
-                }
-                Verbatim => {
-                    return Err(ModcxxError::Unsupported(
-                        "VERBATIM".into(),
-                        self.lexer.code.mark_location(&tok.loc),
-                    ));
-                }
-                _ => stmnts.push(self.statement()?),
-            }
-        }
-        self.expect(RightBrace)?;
-        Ok((slvs, Block::block(&locals, &stmnts, beg)))
+        let body = self.block()?;
+        Ok(Callable::breakpoint(body, blk.loc))
     }
 
     pub fn block(&mut self) -> Result<Block> {
@@ -708,6 +658,7 @@ impl Parser {
     pub fn statement(&mut self) -> Result<Statement> {
         use Type::*;
         match self.lexer.peek().typ {
+            Solve => self.solve(),
             If => {
                 let loc = self.expect(If)?.loc;
                 self.expect(LeftParen)?;

@@ -4,7 +4,7 @@ use crate::{
     err::Result,
     exp::{Callable, Expression, Operator, Statement, Symbol, Unit},
     loc::Location,
-    usr::{Use, Uses},
+    usr::Uses,
     Set,
 };
 
@@ -44,7 +44,7 @@ pub fn arborize(module: &Module) -> Result<Module> {
             .uses()
             .iter()
             .filter_map(|(k, v)| {
-                if v.contains(&Use::W) {
+                if !v.writes.is_empty() {
                     Some(k.to_string())
                 } else {
                     None
@@ -79,7 +79,7 @@ pub fn arborize(module: &Module) -> Result<Module> {
 
     // FUNCTION may never write anything globally visible
     for func in module.functions.iter() {
-        if let Some((k, _)) = func.uses().iter().find(|kv| kv.1.contains(&Use::W)) {
+        if let Some((k, _)) = func.uses().iter().find(|kv| !kv.1.writes.is_empty()) {
             return Err(ModcxxError::ArborUnsupported(format!(
                 "FUNCTION {} writes to a global value: {}.",
                 func.name, k
@@ -114,7 +114,7 @@ fn globals_to_arguments(module: &mut Module) {
 
     fn extend_dummies(proc: &mut Callable, globals: &[Symbol]) {
         // `uses` suppresses shadowed variables.
-        let variables = proc.uses();
+        let variables = proc.uses().0;
         if let Some(ref mut args) = &mut proc.args {
             for global in globals {
                 if variables.contains_key(&global.name)

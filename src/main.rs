@@ -25,6 +25,29 @@ enum Cmd {
     CodeGen { from: String, to: Option<String> },
 }
 
+fn simplify_module(module: &modcxx::ast::Module) -> Result<modcxx::ast::Module> {
+    let mut new = module.clone();
+    loop {
+        let nxt = new
+            .clone()
+            .inline_procedures()?
+        // .inline_functions()?
+            .kinetic_to_sparse()?
+            .assigned_to_local()?
+            .eliminate_dead_blocks()?
+            .splat_blocks()?
+            .eliminate_dead_globals()?
+            .eliminate_dead_locals()?
+            .eliminate_dead_statements()?
+            .simplify()?;
+        if nxt == new {
+            break;
+        }
+        new = nxt;
+    }
+    Ok(new)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -33,27 +56,10 @@ fn main() -> Result<()> {
                 ModcxxError::InternalError(format!("Could not open input file {}", &from))
             })?;
             let src = modcxx::par::parse(&raw)?;
-            let mut new = modcxx::ast::Module::new(&src)?;
-            loop {
-                let nxt = new
-                    .clone()
-                    .inline_procedures()?
-                    // .inline_functions()?
-                    .kinetic_to_sparse()?
-                    .assigned_to_local()?
-                    .eliminate_dead_blocks()?
-                    .splat_blocks()?
-                    .eliminate_dead_statements()?
-                    .eliminate_dead_globals()?
-                    .eliminate_dead_locals()?
-                    .simplify()?;
-                if nxt == new {
-                    break;
-                }
-                new = nxt;
-            }
-            let new = arborize(&new)?;
-            let out = to_nmodl(&new)?;
+            let ast = modcxx::ast::Module::new(&src)?;
+            let new = simplify_module(&ast)?;
+            let arb = arborize(&new)?;
+            let out = to_nmodl(&arb)?;
             if let Some(to) = to {
                 fs::write(to, out).map_err(|_| {
                     ModcxxError::InternalError("Couldn't open output file".to_string())
@@ -67,25 +73,8 @@ fn main() -> Result<()> {
                 ModcxxError::InternalError(format!("Could not open input file {}", &from))
             })?;
             let src = modcxx::par::parse(&raw)?;
-            let mut new = modcxx::ast::Module::new(&src)?;
-            loop {
-                let nxt = new
-                    .clone()
-                    .eliminate_dead_blocks()?
-                    .inline_procedures()?
-                    // .inline_functions()?
-                    .eliminate_dead_blocks()?
-                    .splat_blocks()?
-                    .eliminate_dead_blocks()?
-                    .eliminate_dead_statements()?
-                    .eliminate_dead_globals()?
-                    .eliminate_dead_locals()?
-                    .assigned_to_local()?;
-                if nxt == new {
-                    break;
-                }
-                new = nxt;
-            }
+            let ast = modcxx::ast::Module::new(&src)?;
+            let new = simplify_module(&ast)?;
             let new = arborize(&new)?;
             let out = to_cxx(&new)?;
             if let Some(to) = to {

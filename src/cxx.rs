@@ -27,6 +27,7 @@ impl ToCxxDef for Statement {
             crate::exp::StatementT::Call(_) => todo!(),
             crate::exp::StatementT::Initial(_) => todo!(),
             crate::exp::StatementT::Linear(_, _) => todo!(),
+            crate::exp::StatementT::Solve(_, _) => todo!(),
         }
     }
 }
