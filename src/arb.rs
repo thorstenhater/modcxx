@@ -32,12 +32,16 @@ pub fn arborize(module: &Module) -> Result<Module> {
     // NEURON allows _writing_ to PARAMETER with dubious implications.
     for proc in module
         .procedures
-        .iter()
-        .chain(module.kinetics.iter())
+        .iter_mut()
+        .chain(module.kinetics.iter_mut())
         .chain(
-            [&module.initial, &module.breakpoint, &module.net_receive]
-                .iter()
-                .filter_map(|b| b.as_ref()),
+            [
+                &mut module.initial,
+                &mut module.breakpoint,
+                &mut module.net_receive,
+            ]
+            .iter_mut()
+            .filter_map(|b| b.as_mut()),
         )
     {
         let writes = proc
@@ -52,10 +56,13 @@ pub fn arborize(module: &Module) -> Result<Module> {
             })
             .collect::<Set<_>>();
         for param in &module.parameters {
+            if KNOWN.iter().any(|s| s.0 == param.name) {
+                continue;
+            }
             if writes.contains(&param.name) {
                 return Err(ModcxxError::ArborUnsupported(format!(
-                    "PROCEDURE {} writes to PARAMETER {}.",
-                    proc.name, param.name
+                    "PARAMETER {} is written",
+                    param.name
                 )));
             }
         }
@@ -79,11 +86,12 @@ pub fn arborize(module: &Module) -> Result<Module> {
 
     // FUNCTION may never write anything globally visible
     for func in module.functions.iter() {
-        if let Some((k, _)) = func.uses().iter().find(|kv| !kv.1.writes.is_empty()) {
-            return Err(ModcxxError::ArborUnsupported(format!(
-                "FUNCTION {} writes to a global value: {}.",
-                func.name, k
-            )));
+        if let Some((k, e)) = func.uses().iter().find(|kv| !kv.1.writes.is_empty()) {
+            return Err(ModcxxError::NonPureFunction(
+                func.name.to_string(),
+                k.to_string(),
+                e.writes.first().unwrap().src,
+            ));
         }
     }
 

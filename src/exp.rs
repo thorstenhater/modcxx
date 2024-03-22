@@ -1,8 +1,8 @@
 use std::fmt::{self, Debug};
 use std::ops::{Deref, DerefMut};
 
-use crate::usr::{Inventory, self};
-use crate::{err::Result, loc::Location, Map, Set, usr::Uses};
+use crate::usr::{self, Inventory};
+use crate::{err::Result, loc::Location, usr::Uses, Map, Set};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WithLocation<T: Clone + PartialEq + Eq + Debug> {
@@ -177,9 +177,17 @@ impl Block {
         Ok(res)
     }
 
-    fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
-        let locals = self.locals.iter().map(|l| l.rename_all(lut)).collect::<Result<Vec<_>>>()?;
-        let stmnts = self.stmnts.iter().map(|l| l.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+    pub fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
+        let locals = self
+            .locals
+            .iter()
+            .map(|l| l.rename_all(lut))
+            .collect::<Result<Vec<_>>>()?;
+        let stmnts = self
+            .stmnts
+            .iter()
+            .map(|l| l.rename_all(lut))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self::block(&locals, &stmnts, self.loc))
     }
@@ -209,11 +217,17 @@ impl Statement {
     }
 
     pub fn solve(lhs: &str, m: &str, loc: Location) -> Self {
-        Self::new(StatementT::Solve(lhs.to_string(), SolveT::Method(m.to_string())), loc)
+        Self::new(
+            StatementT::Solve(lhs.to_string(), SolveT::Method(m.to_string())),
+            loc,
+        )
     }
 
     pub fn steadystate(lhs: &str, m: &str, loc: Location) -> Self {
-        Self::new(StatementT::Solve(lhs.to_string(), SolveT::SteadyState(m.to_string())), loc)
+        Self::new(
+            StatementT::Solve(lhs.to_string(), SolveT::SteadyState(m.to_string())),
+            loc,
+        )
     }
 
     pub fn assign(lhs: &str, rhs: Expression, loc: Location) -> Self {
@@ -331,14 +345,18 @@ impl Statement {
                 };
                 let rhs = rhs.rename_all(lut)?;
                 Self::assign(&lhs, rhs, self.loc)
-            },
+            }
             Return(_) => todo!(),
-            Conserve(lhs, rhs) => Self::conserve(lhs.rename_all(lut)?, rhs.rename_all(lut)?, self.loc),
-            Rate(a, b, c, d) => Self::rate(a.rename_all(lut)?,
-                                           b.rename_all(lut)?,
-                                           c.rename_all(lut)?,
-                                           d.rename_all(lut)?,
-                                           self.loc),
+            Conserve(lhs, rhs) => {
+                Self::conserve(lhs.rename_all(lut)?, rhs.rename_all(lut)?, self.loc)
+            }
+            Rate(a, b, c, d) => Self::rate(
+                a.rename_all(lut)?,
+                b.rename_all(lut)?,
+                c.rename_all(lut)?,
+                d.rename_all(lut)?,
+                self.loc,
+            ),
             Linear(lhs, rhs) => Self::linear(lhs.rename_all(lut)?, rhs.rename_all(lut)?, self.loc),
             Derivative(lhs, rhs) => {
                 let lhs = if let Some(lhs) = lut.get(lhs) {
@@ -348,27 +366,30 @@ impl Statement {
                 };
                 let rhs = rhs.rename_all(lut)?;
                 Self::derivative(&lhs, rhs, self.loc)
-            },
-            IfThenElse(c, t, None) => Self::if_then_else(c.rename_all(lut)?,
-                                                      t.rename_all(lut)?,
-                                                      None,
-                                                      self.loc),
-            IfThenElse(c, t, Some(e)) => Self::if_then_else(c.rename_all(lut)?,
-                                                      t.rename_all(lut)?,
-                                                      Some(e.rename_all(lut)?),
-                                                      self.loc),
+            }
+            IfThenElse(c, t, None) => {
+                Self::if_then_else(c.rename_all(lut)?, t.rename_all(lut)?, None, self.loc)
+            }
+            IfThenElse(c, t, Some(e)) => Self::if_then_else(
+                c.rename_all(lut)?,
+                t.rename_all(lut)?,
+                Some(e.rename_all(lut)?),
+                self.loc,
+            ),
             Block(blk) => Self::block(blk.rename_all(lut)?),
-            Call(Expression {data: ExpressionT::Call(nm, args), loc}) => {
-                let nm = if let Some(nm) = lut.get(nm) {
-                    nm
-                } else {
-                    nm
-                };
-                let args = args.iter().map(|a| a.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+            Call(Expression {
+                data: ExpressionT::Call(nm, args),
+                loc,
+            }) => {
+                let nm = if let Some(nm) = lut.get(nm) { nm } else { nm };
+                let args = args
+                    .iter()
+                    .map(|a| a.rename_all(lut))
+                    .collect::<Result<Vec<_>>>()?;
                 Self::call(nm, args, *loc)
             }
             Initial(blk) => Self::initial(blk.rename_all(lut)?, self.loc),
-            _ => unreachable!()
+            _ => unreachable!(),
         };
         Ok(res)
     }
@@ -377,7 +398,11 @@ impl Statement {
 impl Uses for Statement {
     fn uses(&self) -> Inventory {
         let mut res = Inventory::new();
-        let entry = usr::Use { args: 0, src: self.loc, kind: usr::Kind::Global };
+        let entry = usr::Use {
+            args: 0,
+            src: self.loc,
+            kind: usr::Kind::Global,
+        };
         match &self.data {
             StatementT::Linear(lhs, rhs) => {
                 for v in rhs.variables().into_iter() {
@@ -442,7 +467,11 @@ impl Uses for Statement {
                 for (k, v) in ex.uses().into_iter() {
                     res.0.entry(k).or_default().merge(&v);
                 }
-                res.0.entry(format!("{nm}'")).or_default().writes.push(entry);
+                res.0
+                    .entry(format!("{nm}'"))
+                    .or_default()
+                    .writes
+                    .push(entry);
             }
             StatementT::IfThenElse(c, t, e) => {
                 for (k, v) in c.uses().into_iter() {
@@ -458,8 +487,12 @@ impl Uses for Statement {
                 }
             }
             StatementT::Solve(what, _) => {
-                res.0.entry(what.to_string()).or_default().solves.push(entry);
-            },
+                res.0
+                    .entry(what.to_string())
+                    .or_default()
+                    .solves
+                    .push(entry);
+            }
         }
         res
     }
@@ -595,19 +628,23 @@ impl Expression {
         use ExpressionT::*;
         let res = match &self.data {
             Unary(op, ex) => Self::unary(*op, ex.rename_all(lut)?, self.loc),
-            Binary(lhs, op, rhs) => Self::binary(lhs.rename_all(lut)?,
-                                                 *op,
-                                                 rhs.rename_all(lut)?,
-                                                 self.loc),
-            Variable(v) => if let Some(v) = lut.get(v) {
-                Self::variable(v, self.loc)
-            } else {
-                self.clone()
+            Binary(lhs, op, rhs) => {
+                Self::binary(lhs.rename_all(lut)?, *op, rhs.rename_all(lut)?, self.loc)
+            }
+            Variable(v) => {
+                if let Some(v) = lut.get(v) {
+                    Self::variable(v, self.loc)
+                } else {
+                    self.clone()
+                }
             }
             Number(_) => self.clone(),
             String(_) => self.clone(),
             Call(fun, args) => {
-                let args = args.iter().map(|a| a.rename_all(lut)).collect::<Result<Vec<_>>>()?;
+                let args = args
+                    .iter()
+                    .map(|a| a.rename_all(lut))
+                    .collect::<Result<Vec<_>>>()?;
                 let fun = lut.get(fun).unwrap_or(fun);
                 Self::call(fun, args, self.loc)
             }
@@ -620,7 +657,17 @@ impl Uses for Expression {
     fn uses(&self) -> Inventory {
         let mut res = Inventory::new();
         match &self.data {
-            ExpressionT::Variable(v) => res.0.entry(v.to_string()).or_default().reads.push(usr::Use { args: 0, src: self.loc, kind: usr::Kind::Global }),
+            ExpressionT::Variable(v) => {
+                res.0
+                    .entry(v.to_string())
+                    .or_default()
+                    .reads
+                    .push(usr::Use {
+                        args: 0,
+                        src: self.loc,
+                        kind: usr::Kind::Global,
+                    })
+            }
             ExpressionT::String(_) | ExpressionT::Number(_) => {}
             ExpressionT::Unary(_, e) => {
                 for (k, v) in e.uses().into_iter() {
@@ -634,7 +681,6 @@ impl Uses for Expression {
                 for (k, v) in r.uses().into_iter() {
                     res.0.entry(k).or_default().merge(&v);
                 }
-
             }
             // Calls evaluate args left -> right _then_ call the functions.
             ExpressionT::Call(f, es) => {
@@ -643,7 +689,15 @@ impl Uses for Expression {
                         res.0.entry(k).or_default().merge(&v);
                     }
                 }
-                res.0.entry(f.to_string()).or_default().calls.push(usr::Use { args: es.len(), src: self.loc, kind: usr::Kind::Global });
+                res.0
+                    .entry(f.to_string())
+                    .or_default()
+                    .calls
+                    .push(usr::Use {
+                        args: es.len(),
+                        src: self.loc,
+                        kind: usr::Kind::Global,
+                    });
             }
         }
         res
@@ -860,8 +914,12 @@ impl Uses for Callable {
         if let Some(args) = &self.args {
             for arg in args {
                 if let Some(e) = res.0.get_mut(&arg.name) {
-                    e.reads.iter_mut().for_each(|r| r.kind = usr::Kind::Argument);
-                    e.writes.iter_mut().for_each(|r| r.kind = usr::Kind::Argument);
+                    e.reads
+                        .iter_mut()
+                        .for_each(|r| r.kind = usr::Kind::Argument);
+                    e.writes
+                        .iter_mut()
+                        .for_each(|r| r.kind = usr::Kind::Argument);
                 }
             }
         }
@@ -880,7 +938,7 @@ mod test {
         let loc = Location::default();
         let blk = Block::block(
             &[Symbol::local("a", loc), Symbol::local("b", loc)],
-            &[Statement::assign("a", Expression::number("42", loc), loc),],
+            &[Statement::assign("a", Expression::number("42", loc), loc)],
             loc,
         );
         let res = blk.splat_blocks().unwrap();
@@ -936,12 +994,14 @@ mod test {
 
         let blk = Block::block(
             &[Symbol::local("a", loc), Symbol::local("b", loc)],
-            &[Statement::assign("a", Expression::number("42", loc), loc),
-              Statement::block(Block::block(
-                  &[Symbol::local("a", loc), Symbol::local("b", loc)],
-                  &[Statement::assign("b", Expression::number("42", loc), loc)],
-                  loc,
-              ))],
+            &[
+                Statement::assign("a", Expression::number("42", loc), loc),
+                Statement::block(Block::block(
+                    &[Symbol::local("a", loc), Symbol::local("b", loc)],
+                    &[Statement::assign("b", Expression::number("42", loc), loc)],
+                    loc,
+                )),
+            ],
             loc,
         );
 
@@ -983,13 +1043,17 @@ mod test {
         assert!(res.is_called("foo").is_some());
         assert!(res.is_called("bar").is_some());
 
-        let s = Parser::new_from_str("
+        let s = Parser::new_from_str(
+            "
 if (v > 0) {
   x = y
   a = 42
 } else {
   x = z + a
-}").statement().unwrap();
+}",
+        )
+        .statement()
+        .unwrap();
 
         eprintln!("{s:?}");
 

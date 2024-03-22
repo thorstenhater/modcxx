@@ -1,7 +1,4 @@
-use crate::{
-    lex::Type,
-    loc::Location
-};
+use crate::{lex::Type, loc::Location};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ModcxxError>;
@@ -56,4 +53,6 @@ pub enum ModcxxError {
     IntermingledReactionNormal(Location),
     #[error("Internal Error {0}.")]
     InternalError(String),
+    #[error("FUNCTIONs should be pure, yet '{0}' writes to global value '{1}' here {2:?}.")]
+    NonPureFunction(String, String, Location),
 }

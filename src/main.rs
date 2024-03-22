@@ -31,7 +31,7 @@ fn simplify_module(module: &modcxx::ast::Module) -> Result<modcxx::ast::Module> 
         let nxt = new
             .clone()
             .inline_procedures()?
-        // .inline_functions()?
+            // .inline_functions()?
             .kinetic_to_sparse()?
             .assigned_to_local()?
             .eliminate_dead_blocks()?

@@ -10,7 +10,7 @@ trait ToCxxDef {
 
 impl ToCxxDef for Symbol {
     fn def(&self, ind: usize) -> String {
-        format!("{:ind$}{}", "", self.name.to_string())
+        format!("{:ind$}{}", "", self.name)
     }
 }
 
@@ -148,7 +148,7 @@ impl ToCxxDecl for Option<Unit> {
 
 impl ToCxxDecl for Symbol {
     fn decl(&self, ind: usize) -> String {
-        format!("{} {}", self.unit.decl(ind), self.name.to_string())
+        format!("{} {}", self.unit.decl(ind), self.name)
     }
 }
 

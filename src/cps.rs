@@ -226,6 +226,24 @@ pub enum Val {
     Real(String),
 }
 
+impl Val {
+    fn to_cxx(&self) -> String {
+        match self {
+            Val::Unit => String::from("void"),
+            Val::Bool(b) => format!("{b}"),
+            Val::Real(r) => r.to_string(),
+        }
+    }
+
+   fn to_type(&self) -> String {
+        match self {
+            Val::Unit => String::from("void"),
+            Val::Bool(_) => String::from("bool"),
+            Val::Real(_) => String::from("double"),
+        }
+    }
+}
+
 impl fmt::Display for Val {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
@@ -284,7 +302,7 @@ pub enum Term {
         then: CVar,
         or: CVar,
     },
-    SetThen {
+    SetThen{
         name: Var,
         value: Var,
         body: Box<Term>,
@@ -292,6 +310,23 @@ pub enum Term {
 }
 
 impl Term {
+    pub fn to_cxx(&self, ind: usize) -> String {
+        match self {
+            Term::Var(v) => v.to_string(),
+            Term::LetVal { name, value, body } => {
+                let ty = value.to_type();
+                let value = value.to_cxx();
+                let rest = body.to_cxx(ind);
+                format!("{ty} {name} = {value};\n{rest}")
+            }
+            Term::SetThen { name, value, body } => {
+                let rest = body.to_cxx(ind);
+                format!("{name} = {value};\n{rest}")
+            }
+            _ => String::from("???"),
+        }
+    }
+
     pub fn var<V>(v: V) -> Self
     where
         Var: From<V>,
@@ -563,32 +598,6 @@ pub fn kps(ml: ML, k: CVar) -> Term {
     }
 }
 
-/*
-    fn tmp(Term) -> Term {
-        match self {
-            Term::Var(v) => ,
-            Term::LetVal { name, value, body } => ,
-            Term::LetFun {
-                name,
-                cont,
-                args,
-                term,
-                body,
-            } => ,
-            Term::LetCnt {
-                name,
-                args,
-                term,
-                body,
-            } => ,
-            Term::AppCnt { name, args } => ,
-            Term::AppFun { name, cont, args } => ,
-            Term::IfElse { cond, then, or } => ,
-            Term::SetThen { name, value, body } => ,
-        }
-    }
-*/
-
 pub fn dead_code(term: Term) -> Term {
     match term {
         Term::LetVal { name, body, value } => {
@@ -635,41 +644,40 @@ pub fn dead_code(term: Term) -> Term {
 
 fn used(term: &Term) -> Set<Var> {
     let mut res = Set::new();
-    used_(term, &mut res);
-    res
-}
-
-fn used_(term: &Term, seen: &mut Set<Var>) {
-    match term {
-        Term::Var(v) => {
-            seen.insert(v.to_string());
-        }
-        Term::LetVal { body, .. } => used_(body, seen),
-        Term::LetFun { body, .. } => used_(body, seen),
-        Term::LetCnt { body, .. } => used_(body, seen),
-        Term::AppCnt { name, args } => {
-            seen.insert(name.to_string());
-            for arg in args {
-                seen.insert(arg.to_string());
+    fn used_(term: &Term, seen: &mut Set<Var>) {
+        match term {
+            Term::Var(v) => {
+                seen.insert(v.to_string());
             }
-        }
-        Term::AppFun { name, cont, args } => {
-            seen.insert(name.to_string());
-            seen.insert(cont.to_string());
-            for arg in args {
-                seen.insert(arg.to_string());
+            Term::LetVal { body, .. } => used_(body, seen),
+            Term::LetFun { body, .. } => used_(body, seen),
+            Term::LetCnt { body, .. } => used_(body, seen),
+            Term::AppCnt { name, args } => {
+                seen.insert(name.to_string());
+                for arg in args {
+                    seen.insert(arg.to_string());
+                }
             }
-        }
-        Term::IfElse { cond, then, or } => {
-            seen.insert(cond.to_string());
-            seen.insert(then.to_string());
-            seen.insert(or.to_string());
-        }
-        Term::SetThen { name, body, .. } => {
-            seen.insert(name.to_string());
-            used_(body, seen);
+            Term::AppFun { name, cont, args } => {
+                seen.insert(name.to_string());
+                seen.insert(cont.to_string());
+                for arg in args {
+                    seen.insert(arg.to_string());
+                }
+            }
+            Term::IfElse { cond, then, or } => {
+                seen.insert(cond.to_string());
+                seen.insert(then.to_string());
+                seen.insert(or.to_string());
+            }
+            Term::SetThen { name, body, .. } => {
+                seen.insert(name.to_string());
+                used_(body, seen);
+            }
         }
     }
+    used_(term, &mut res);
+    res
 }
 
 fn propagate_values(term: Term) -> Term {
@@ -762,7 +770,7 @@ mod test {
             ]),
             Box::new(|x| Term::Var(x)),
         );
-        println!("{res}")
+        println!("{}", res.to_cxx(0))
     }
 
     #[test]

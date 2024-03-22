@@ -1,7 +1,7 @@
 use std::iter::Peekable;
 use std::str::Chars;
 
-use crate::{src::Code, loc::Location};
+use crate::{loc::Location, src::Code};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Type {
@@ -123,8 +123,9 @@ impl Token {
     }
 }
 
-pub const KEYWORDS: [(&'static str, Type); 53] = [
+pub const KEYWORDS: &[(&str, Type)] = &[
     ("INITIAL", Type::Initial),
+    ("Initial", Type::Initial),
     ("DESTRUCTOR", Type::Destructor),
     ("NEURON", Type::Neuron),
     ("INCLUDE", Type::Include),

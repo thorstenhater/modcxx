@@ -2,10 +2,10 @@ use crate::{
     ast::Module,
     err::{ModcxxError, Result},
     exp::{
-        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT,
-        Symbol, Unit, Variable, SolveT,
+        Access, Block, Callable, Expression, ExpressionT, Operator, SolveT, Statement, StatementT,
+        Symbol, Variable,
     },
-    par::Kind,
+    par::{Kind, Units},
 };
 
 pub fn to_nmodl(module: &Module) -> Result<String> {
@@ -136,10 +136,10 @@ fn neuron(nrn: &Module) -> Result<String> {
     Ok(res.join("\n"))
 }
 
-fn units(raw: &[(Unit, Unit)]) -> Result<String> {
+fn units(raw: &Units) -> Result<String> {
     let mut len = 0;
     let mut names = Vec::new();
-    for (nm, desc) in raw {
+    for (nm, desc) in raw.names.iter().zip(raw.definitions.iter()) {
         match &nm.data {
             ExpressionT::Variable(nm) => {
                 names.push((nm.to_string(), unit(&desc.data)?));
@@ -303,7 +303,7 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
     let mut res = Vec::new();
     match &stmnt.data {
         StatementT::Solve(it, how) => {
-            let ln =match how {
+            let ln = match how {
                 SolveT::Default => format!("{:ind$}SOLVE {}", "", it),
                 SolveT::Method(m) => format!("{:ind$}SOLVE {} METHOD {}", "", it, m),
                 SolveT::SteadyState(m) => format!("{:ind$}SOLVE {} STEADYSTATE {}", "", it, m),

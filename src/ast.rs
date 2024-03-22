@@ -1,14 +1,13 @@
 use crate::{
     err::{ModcxxError, Result},
     exp::{
-        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol,
-        Unit, Variable
+        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol, Variable,
     },
-    usr::{Uses, Inventory, self},
     lex::KEYWORDS,
-    opt::Simplify,
-    par::{self, Ion, Kind},
     loc::Location,
+    opt::Simplify,
+    par::{self, Ion, Kind, Units},
+    usr::{self, Inventory, Uses},
     Map, Set,
 };
 
@@ -28,7 +27,7 @@ pub struct Module {
     pub states: Vec<Symbol>,
     pub assigned: Vec<Symbol>,
     pub parameters: Vec<Symbol>,
-    pub units: Vec<(Unit, Unit)>,
+    pub units: Units,
     pub procedures: Vec<Callable>,
     pub kinetics: Vec<Callable>,
     pub linears: Vec<Callable>,
@@ -37,9 +36,15 @@ pub struct Module {
     pub net_receive: Option<Callable>,
 }
 
-pub const FUNCTIONS: [(&'static str, usize); 4] =
-    [("exp", 1), ("exprelr", 1), ("fabs", 1), ("log", 1)];
-pub const KNOWN: [(&'static str, &'static str); 4] = [
+pub const FUNCTIONS: &[(&str, usize)] = &[
+    ("exp", 1),
+    ("exprelr", 1),
+    ("fabs", 1),
+    ("log", 1),
+    ("log10", 1),
+    ("max", 2),
+];
+pub const KNOWN: &[(&str, &str)] = &[
     ("celsius", "degC"),
     ("v", "mV"),
     ("area", "um2"),
@@ -193,7 +198,13 @@ impl Module {
     pub fn eliminate_dead_blocks(mut self) -> Result<Self> {
         // weed out vacuous callables
         let mut void = Set::new();
-        for ps in &[&self.procedures, &self.linears, &self.kinetics, &self.derivatives, &self.functions] {
+        for ps in &[
+            &self.procedures,
+            &self.linears,
+            &self.kinetics,
+            &self.derivatives,
+            &self.functions,
+        ] {
             for p in ps.iter() {
                 if p.data.body.stmnts.is_empty() {
                     void.insert(p.name.to_string());
@@ -231,7 +242,13 @@ impl Module {
 
         let mut todo = used.iter().cloned().collect::<Vec<_>>();
         while let Some(name) = todo.pop() {
-            for kind in &[&self.kinetics, &self.derivatives, &self.procedures, &self.functions, &self.linears] {
+            for kind in &[
+                &self.kinetics,
+                &self.derivatives,
+                &self.procedures,
+                &self.functions,
+                &self.linears,
+            ] {
                 if let Some(blk) = kind.iter().find(|p| p.name == name) {
                     for (k, v) in blk.uses().into_iter() {
                         if used.contains(&k) {
@@ -246,7 +263,13 @@ impl Module {
             }
         }
 
-        for kind in &mut [&mut self.kinetics, &mut self.derivatives, &mut self.procedures, &mut self.functions, &mut self.linears] {
+        for kind in &mut [
+            &mut self.kinetics,
+            &mut self.derivatives,
+            &mut self.procedures,
+            &mut self.functions,
+            &mut self.linears,
+        ] {
             kind.retain(|blk| used.contains(&blk.name));
         }
         Ok(self)
@@ -335,23 +358,22 @@ impl Module {
         Ok(self)
     }
 
-
     pub fn eliminate_dead_globals(mut self) -> Result<Self> {
         loop {
             let mut used = Set::new();
 
-            for blk in &[
-                &self.initial,
-                &self.breakpoint,
-                &self.net_receive,
-            ] {
+            for blk in &[&self.initial, &self.breakpoint, &self.net_receive] {
                 if let Some(blk) = blk {
                     used.append(&mut blk.uses().0.keys().cloned().collect());
                 }
             }
 
-
-            for blks in &[&self.kinetics, &self.derivatives, &self.procedures, &self.functions] {
+            for blks in &[
+                &self.kinetics,
+                &self.derivatives,
+                &self.procedures,
+                &self.functions,
+            ] {
                 for blk in blks.iter() {
                     used.append(&mut blk.uses().0.keys().cloned().collect());
                 }
@@ -367,17 +389,17 @@ impl Module {
                 + self.ranges.len();
 
             for vars in &mut [&mut self.constants, &mut self.parameters, &mut self.states] {
-                vars.retain(|v| { used.contains(&v.name) });
+                vars.retain(|v| used.contains(&v.name));
             }
             self.ions
                 .iter_mut()
                 .for_each(|ion| ion.vars.retain(|var| used.contains(&var.name)));
             self.ions.retain(|ion| !ion.vars.is_empty());
 
-            self.ranges.retain(|r|
+            self.ranges.retain(|r| {
                 self.assigned.iter().any(|v| r == &v.name)
                     || self.parameters.iter().any(|v| r == &v.name)
-            );
+            });
 
             let new_len = self.assigned.len()
                 + self.constants.len()
@@ -468,7 +490,10 @@ impl Module {
                     StatementT::IfThenElse(_, ref mut t, None) => {
                         do_inline(t, inlinable)?;
                     }
-                    StatementT::Call(Expression { data: ExpressionT::Call(nm, _), ..}) if inlinable.contains_key(nm) => {
+                    StatementT::Call(Expression {
+                        data: ExpressionT::Call(nm, _),
+                        ..
+                    }) if inlinable.contains_key(nm) => {
                         *stmnt = Statement::block(inlinable[nm].clone());
                     }
                     StatementT::Solve(nm, _) if inlinable.contains_key(nm) => {
@@ -484,7 +509,12 @@ impl Module {
         // Collect all inlinable blocks regardless of provenance and convert
         // potential arguments into locals.
         let mut inlinable = Map::new();
-        for prcs in &[&self.derivatives, &self.kinetics, &self.linears, &self.procedures] {
+        for prcs in &[
+            &self.derivatives,
+            &self.kinetics,
+            &self.linears,
+            &self.procedures,
+        ] {
             for prc in prcs.iter() {
                 let mut body = prc.body.clone();
                 if let Some(ref args) = prc.args {
@@ -507,17 +537,24 @@ impl Module {
         // One of Read only, Write only, Write _after_ Read, Read after Write,
         // might be undefined if branches break things
         #[derive(Copy, Clone, PartialEq, Eq)]
-        enum Action { R, W, WR, RW, NA }
+        enum Action {
+            R,
+            W,
+            WR,
+            RW,
+            NA,
+        }
 
         fn add(res: &mut Map<String, Action>, var: &str, act: Action) {
             let new = match res.get(var) {
                 Some(Action::NA) => Action::NA,
                 Some(Action::RW) => Action::RW,
                 Some(Action::WR) => Action::WR,
-                Some(Action::W) => { // had W ...
+                Some(Action::W) => {
+                    // had W ...
                     match act {
-                        Action::W => Action::W, // WW => W
-                        Action::R => Action::WR, // WR => WR
+                        Action::W => Action::W,   // WW => W
+                        Action::R => Action::WR,  // WR => WR
                         Action::RW => Action::WR, // WRW => WR
                         Action::WR => Action::WR, // WWR => WR
                         Action::NA => Action::NA,
@@ -525,8 +562,8 @@ impl Module {
                 }
                 Some(Action::R) => {
                     match act {
-                        Action::R => Action::R, // RR => R
-                        Action::W => Action::RW, // RW => RW
+                        Action::R => Action::R,   // RR => R
+                        Action::W => Action::RW,  // RW => RW
                         Action::RW => Action::RW, // RRW => RW
                         Action::WR => Action::WR, // RWR => RW
                         Action::NA => Action::NA,
@@ -537,14 +574,13 @@ impl Module {
             res.insert(var.to_string(), new);
         }
 
-
         fn list_accesses(blk: &Block, locals: &mut Vec<String>, res: &mut Map<String, Action>) {
             for v in &blk.locals {
                 locals.push(v.name.to_string())
             }
             for stmnt in &blk.stmnts {
                 match &stmnt.data {
-                    StatementT::Block(blk) => list_accesses(&blk, locals, res),
+                    StatementT::Block(blk) => list_accesses(blk, locals, res),
                     StatementT::IfThenElse(c, t, Some(e)) => {
                         for var in c.variables() {
                             add(res, &var, Action::R);
@@ -578,13 +614,13 @@ impl Module {
                         list_accesses(t, locals, res);
                     }
                     StatementT::Assign(lhs, rhs) => {
-                        add(res, &lhs, Action::W);
+                        add(res, lhs, Action::W);
                         for var in rhs.variables() {
                             add(res, &var, Action::R);
                         }
                     }
                     StatementT::Return(_) => unreachable!(), // we don't handle FUNCTION
-                    StatementT::Call(_) => unreachable!(), // we have already inlined all of these
+                    StatementT::Call(_) => unreachable!(),   // we have already inlined all of these
                     StatementT::Solve(_, _) => unreachable!(), // we have already inlined all of these
                     StatementT::Initial(_) => unreachable!(),  // Not supported
                     StatementT::Conserve(lhs, rhs) => {
@@ -637,39 +673,48 @@ impl Module {
             }
         }
 
-        let accesses = blocks.iter().map(|blk| {
-            let mut locals = Vec::new();
-            let mut res = Map::new();
-            list_accesses(&blk.body, &mut locals, &mut res);
-            res
-        }).collect::<Vec<_>>();
+        let accesses = blocks
+            .iter()
+            .map(|blk| {
+                let mut locals = Vec::new();
+                let mut res = Map::new();
+                list_accesses(&blk.body, &mut locals, &mut res);
+                res
+            })
+            .collect::<Vec<_>>();
 
-        let localize = self.assigned.iter().filter_map(|nm| {
-            accesses.iter().all(|tab| {
-                match tab.get(&nm.name) {
-                    None | Some(Action::WR) | Some(Action::W) => true,
-                    _ => false,
-                }
-            }).then_some(nm.name.to_string())
-        }).collect::<Set<_>>();
+        let localize = self
+            .assigned
+            .iter()
+            .filter_map(|nm| {
+                accesses
+                    .iter()
+                    .all(|tab|matches!(tab.get(&nm.name), None | Some(Action::WR) | Some(Action::W)))
+                    .then_some(nm.name.to_string())
+            })
+            .collect::<Set<_>>();
         eprintln!("Can localize: {localize:?}");
         self.assigned.retain(|v| !localize.contains(&v.name));
 
-        for blk in &mut [&mut self.initial,
-                         &mut self.net_receive,
-                         &mut self.breakpoint,
-                        ] {
+        for blk in &mut [
+            &mut self.initial,
+            &mut self.net_receive,
+            &mut self.breakpoint,
+        ] {
             if let Some(ref mut blk) = blk {
                 let uses = blk.uses();
                 for local in localize.iter() {
                     if uses.is_read_kind(local, usr::Kind::Global).is_some() {
-                        blk.data.body.data.locals.push(Variable::local(local, blk.loc));
+                        blk.data
+                            .body
+                            .data
+                            .locals
+                            .push(Variable::local(local, blk.loc));
                     }
                 }
             }
         }
 
-        
         Ok(self)
     }
 
@@ -706,12 +751,22 @@ impl Module {
             }
             Ok(())
         }
-        for prcs in &mut [&mut self.derivatives, &mut self.kinetics, &mut self.procedures, &mut self.functions, &mut self.linears] {
+        for prcs in &mut [
+            &mut self.derivatives,
+            &mut self.kinetics,
+            &mut self.procedures,
+            &mut self.functions,
+            &mut self.linears,
+        ] {
             for prc in prcs.iter_mut() {
                 eliminate_locals(&mut prc.body)?;
             }
         }
-        for blk in &mut [&mut self.initial, &mut self.breakpoint, &mut self.net_receive] {
+        for blk in &mut [
+            &mut self.initial,
+            &mut self.breakpoint,
+            &mut self.net_receive,
+        ] {
             if let Some(ref mut blk) = blk {
                 eliminate_locals(&mut blk.body)?;
             }
@@ -730,9 +785,13 @@ impl Module {
             res.stmnts.clear();
             for stmnt in blk.stmnts.iter() {
                 match &stmnt.data {
-                    StatementT::Call(Expression { data: ExpressionT::Call(ref nm, _), .. }) if functions.contains(nm) => continue,
+                    StatementT::Call(Expression {
+                        data: ExpressionT::Call(ref nm, _),
+                        ..
+                    }) if functions.contains(nm) => continue,
                     StatementT::Block(blk) => {
-                        res.stmnts.push(Statement::block(eliminate_bare_calls(functions, &blk)?));
+                        res.stmnts
+                            .push(Statement::block(eliminate_bare_calls(functions, blk)?));
                     }
                     _ => res.stmnts.push(stmnt.clone()),
                 }
@@ -740,15 +799,29 @@ impl Module {
             Ok(res)
         }
 
-        let functions = self.functions.iter().map(|f| f.name.to_string()).collect::<Set<_>>();
+        let functions = self
+            .functions
+            .iter()
+            .map(|f| f.name.to_string())
+            .collect::<Set<_>>();
 
-        for blk in &mut [&mut self.initial, &mut self.breakpoint, &mut self.net_receive] {
+        for blk in &mut [
+            &mut self.initial,
+            &mut self.breakpoint,
+            &mut self.net_receive,
+        ] {
             if let Some(ref mut blk) = blk {
                 blk.body = eliminate_bare_calls(&functions, &blk.body)?;
             }
         }
 
-        for prcs in &mut [&mut self.derivatives, &mut self.kinetics, &mut self.procedures, &mut self.functions, &mut self.linears] {
+        for prcs in &mut [
+            &mut self.derivatives,
+            &mut self.kinetics,
+            &mut self.procedures,
+            &mut self.functions,
+            &mut self.linears,
+        ] {
             for prc in prcs.iter_mut() {
                 prc.body = eliminate_bare_calls(&functions, &prc.body)?;
             }
@@ -766,13 +839,20 @@ fn inline_into_block(blk: &mut Block, procs: &Map<String, (Vec<String>, Block)>)
             match stmnt.data {
                 StatementT::Call(Expression {
                     data: ExpressionT::Call(ref cname, ref cargs),
-                    loc
+                    loc,
                 }) => {
                     if let Some((pargs, pbody)) = procs.get(cname) {
                         let mut new = Statement::block(pbody.clone());
-                        let lut = pbody.locals.iter()
-                                              .map(|l| (l.name.clone(), format!("{}_{}_{}", l.name, loc.line, loc.column)))
-                                              .collect::<Map<String, String>>();
+                        let lut = pbody
+                            .locals
+                            .iter()
+                            .map(|l| {
+                                (
+                                    l.name.clone(),
+                                    format!("{}_{}_{}", l.name, loc.line, loc.column),
+                                )
+                            })
+                            .collect::<Map<String, String>>();
                         new = new.rename_all(&lut)?;
                         for (f, t) in pargs.iter().zip(cargs.iter()) {
                             new = new.substitute(&ExpressionT::Variable(f.to_string()), t)?
@@ -801,18 +881,52 @@ fn check_duplicates_and_keywords(module: &Module) -> Result<()> {
         if let Some(old) = seen.get(name) {
             return Err(ModcxxError::DuplicateSymbol(name.to_string(), loc, *old));
         }
-        if KEYWORDS.iter().find(|p| p.0 == name).is_some() {
+        if KEYWORDS.iter().any(|p| p.0 == name) {
             return Err(ModcxxError::ReservedWord(name.to_string(), loc));
         }
         seen.insert(name.to_string(), loc);
         Ok(())
     }
 
+    let ionic = module
+        .ions
+        .iter()
+        .flat_map(|i| i.vars.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let assigned = module
+        .assigned
+        .iter()
+        .filter(|v| {
+            !module
+                .non_specific_currents
+                .iter()
+                .any(|s| s.name == v.name)
+        })
+        .filter(|v| !ionic.iter().any(|s| s.name == v.name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let parameters = module
+        .parameters
+        .iter()
+        .filter(|v| {
+            !module
+                .non_specific_currents
+                .iter()
+                .any(|s| s.name == v.name)
+        })
+        .filter(|v| !ionic.iter().any(|s| s.name == v.name))
+        .cloned()
+        .collect::<Vec<_>>();
+
     let mut seen = Map::new();
     for items in &[
         &module.non_specific_currents,
-        &module.assigned,
-        &module.parameters,
+        &assigned,
+        &ionic,
+        &parameters,
         &module.constants,
     ] {
         for item in items.iter() {
@@ -842,10 +956,10 @@ fn check_scope(
 ) -> Result<()> {
     for (var, n) in functions {
         if let Some(e) = uses.is_read(var).or(uses.is_written(var)) {
-            return Err(ModcxxError::CallableNotVariable(var.to_string(), e.src))
+            return Err(ModcxxError::CallableNotVariable(var.to_string(), e.src));
         }
         if let Some(e) = uses.is_solved(var) {
-            return Err(ModcxxError::CallableNotSolvable(var.to_string(), e.src))
+            return Err(ModcxxError::CallableNotSolvable(var.to_string(), e.src));
         }
         if let Some(es) = uses.get(var) {
             for e in es.calls.iter() {
@@ -860,11 +974,11 @@ fn check_scope(
             return Err(ModcxxError::VariableNotCallable(var.to_string(), e.src));
         }
         if let Some(e) = uses.is_solved(var) {
-            return Err(ModcxxError::VariableNotSolvable(var.to_string(), e.src))
+            return Err(ModcxxError::VariableNotSolvable(var.to_string(), e.src));
         }
         if *acc == Access::RO {
             if let Some(e) = uses.is_written_kind(var, usr::Kind::Global) {
-                return Err(ModcxxError::WriteToRO(var.to_string(), e.src))
+                return Err(ModcxxError::WriteToRO(var.to_string(), e.src));
             }
         }
     }
@@ -878,14 +992,16 @@ fn check_scope(
     }
 
     for k in uses.0.keys() {
-        if let Some(e) = uses.is_solved(k)
-                             .or(uses.is_called(k))
-                             .or(uses.is_read_kind(k, usr::Kind::Global))
-                             .or(uses.is_written_kind(k, usr::Kind::Global)) {
-                                 if !globals.contains_key(k) && !solvables.contains(k) && !functions.contains_key(k) {
-                                     return Err(ModcxxError::UnboundName(k.to_string(), e.src));
-                                 }
-                             }
+        if let Some(e) = uses
+            .is_solved(k)
+            .or(uses.is_called(k))
+            .or(uses.is_read_kind(k, usr::Kind::Global))
+            .or(uses.is_written_kind(k, usr::Kind::Global))
+        {
+            if !globals.contains_key(k) && !solvables.contains(k) && !functions.contains_key(k) {
+                return Err(ModcxxError::UnboundName(k.to_string(), e.src));
+            }
+        }
     }
 
     Ok(())
@@ -893,7 +1009,7 @@ fn check_scope(
 
 fn check_scopes(module: &Module) -> Result<()> {
     let mut globals = Map::new();
-    for g in &KNOWN {
+    for g in KNOWN {
         globals.insert(g.0.to_string(), Access::RO);
     }
     for vars in &[
@@ -918,6 +1034,9 @@ fn check_scopes(module: &Module) -> Result<()> {
         for var in &ion.vars {
             globals.insert(var.name.to_string(), var.access);
         }
+        if let Some(Expression { data: ExpressionT::Variable(v), .. }) = &ion.vale {
+            globals.insert(v.to_string(), Access::RO);
+        } 
     }
 
     let mut funcs = FUNCTIONS
@@ -1400,7 +1519,7 @@ NET_RECEIVE() {}
 
     #[test]
     fn dead_statements() {
-let s = par::parse(
+        let s = par::parse(
             "
 NEURON { SUFFIX test }
 
@@ -1414,8 +1533,10 @@ FUNCTION foo() {
 ",
         )
         .unwrap();
-        let m = Module::new(&s).unwrap().eliminate_dead_statements().unwrap();
+        let m = Module::new(&s)
+            .unwrap()
+            .eliminate_dead_statements()
+            .unwrap();
         assert!(m.breakpoint.unwrap().body.data.stmnts.is_empty());
     }
-
 }

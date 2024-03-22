@@ -1,15 +1,26 @@
 use crate::err::{ModcxxError, Result};
 use crate::lex::{Lexer, Token, Type};
-use crate::src::Code;
 use crate::loc::Location;
+use crate::src::Code;
 
 use crate::exp::{
-    self,
-    Block, Callable, Expression, ExpressionT, Independent, Operator, Statement, StatementT, Symbol,
-    Unit, Variable,
+    self, Block, Callable, Expression, ExpressionT, Independent, Operator, Statement, StatementT,
+    Symbol, Unit, Variable,
 };
 
 use crate::Set;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Units {
+    pub names: Vec<Unit>,
+    pub definitions: Vec<Unit>,
+}
+
+impl Units {
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Module {
@@ -22,7 +33,7 @@ pub struct Module {
     pub states: Vec<Variable>,
     pub assigned: Vec<Symbol>,
     pub parameters: Vec<Symbol>,
-    pub units: Vec<(Unit, Unit)>,
+    pub units: Units,
     pub procedures: Vec<Callable>,
     pub kinetics: Vec<Callable>,
     pub linears: Vec<Callable>,
@@ -50,7 +61,7 @@ pub struct NeuronKind {
 pub struct Ion {
     pub name: String,
     pub vars: Vec<Symbol>,
-    pub vale: Option<String>,
+    pub vale: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -157,11 +168,12 @@ impl Parser {
     }
 
     /// Parse UNITS block; return list of units
-    fn units(&mut self) -> Result<(Vec<(Unit, Unit)>, Vec<Symbol>)> {
+    fn units(&mut self) -> Result<(Units, Vec<Symbol>)> {
         use Type::*;
         self.expect(Units)?;
         self.expect(LeftBrace)?;
         let mut units = Vec::new();
+        let mut defs = Vec::new();
         let mut consts = Vec::new();
         loop {
             match self.lexer.peek().typ {
@@ -169,7 +181,8 @@ impl Parser {
                     let lhs = self.unit()?.unwrap();
                     self.expect(Assign)?;
                     let rhs = self.unit()?.unwrap();
-                    units.push((lhs, rhs));
+                    units.push(lhs);
+                    defs.push(rhs);
                 }
                 Identifier => {
                     let id = self.expect(Identifier)?;
@@ -183,7 +196,8 @@ impl Parser {
                         LeftParen => {
                             let lhs = self.unit()?.unwrap();
                             let rhs = self.unit()?.unwrap();
-                            units.push((lhs.clone(), rhs));
+                            units.push(lhs.clone());
+                            defs.push(rhs.clone());
                             consts.push(Symbol::known(&id.val.unwrap(), Some(lhs.clone()), id.loc));
                         }
                         _ => unreachable!(),
@@ -196,7 +210,7 @@ impl Parser {
             }
         }
         self.expect(RightBrace)?;
-        Ok((units, consts))
+        Ok((self::Units {names: units, definitions: defs} , consts))
     }
 
     /// Parse INDEPENDENT blocks
@@ -342,7 +356,7 @@ impl Parser {
             Vec::new()
         };
         let q = if self.matches(Valence).is_some() {
-            Some(self.number()?)
+            Some(self.expression()?)
         } else {
             None
         };
@@ -427,7 +441,8 @@ impl Parser {
                 State => result.states.extend(self.states()?),
                 Units => {
                     let (mut units, mut consts) = self.units()?;
-                    result.units.append(&mut units);
+                    result.units.names.append(&mut units.names);
+                    result.units.definitions.append(&mut units.definitions);
                     result.constants.append(&mut consts);
                 }
                 Parameter => result.parameters.extend(self.parameters()?),
@@ -755,7 +770,7 @@ impl Parser {
         }
     }
 
-    fn expression(&mut self) -> Result<Expression> {
+    pub fn expression(&mut self) -> Result<Expression> {
         self.logical()
     }
 
@@ -1001,6 +1016,7 @@ pub fn parse(input: &str) -> Result<Module> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn fabs() {
@@ -1091,7 +1107,9 @@ na READ
         let exp = vec![Ion {
             name: String::from("na"),
             vars: vec![],
-            vale: Some(String::from("-42")),
+            vale: Some(Expression::unary(Operator::Neg,
+                                         Expression::number("42", Location { line: 0, column: 40, position: 40 }),
+                                         Location { line: 0, column: 39, position: 39 })),
         }];
         assert_eq!(
             parse("NEURON{SUFFIX foobar USEION na VALENCE -42}")
@@ -1102,6 +1120,13 @@ na READ
                 .ions,
             exp
         );
+        let exp = vec![Ion {
+            name: String::from("na"),
+            vars: vec![],
+            vale: Some(Expression::unary(Operator::Neg,
+                                         Expression::number("42", Location { line: 0, column: 44, position: 44 }),
+                                         Location { line: 0, column: 39, position: 39 })),
+        }];
         assert_eq!(
             parse("NEURON{SUFFIX foobar USEION na VALENCE -    42}")
                 .unwrap()
