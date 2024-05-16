@@ -1,15 +1,22 @@
 use crate::{
     err::{ModcxxError, Result},
     exp::{
-        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol, Variable,
+        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol,
+        Variable, SolveT
     },
     lex::KEYWORDS,
     loc::Location,
     opt::Simplify,
     par::{self, Ion, Kind, Units},
     usr::{self, Inventory, Uses},
-    Map, Set,
+    Map, Set, ode::cnexp,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Opt {
+    O1,
+    Ofast,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
@@ -38,11 +45,14 @@ pub struct Module {
 
 pub const FUNCTIONS: &[(&str, usize)] = &[
     ("exp", 1),
+    ("sin", 1),
+    ("cos", 1),
     ("exprelr", 1),
     ("fabs", 1),
     ("log", 1),
     ("log10", 1),
     ("max", 2),
+    ("min", 2),
 ];
 pub const KNOWN: &[(&str, &str)] = &[
     ("celsius", "degC"),
@@ -99,13 +109,22 @@ impl Module {
 
         let non_specific_currents = nrn.non_specific_currents.clone();
         let ions = nrn.ions.clone();
+
+        let builtins = ions
+            .iter()
+            .flat_map(|i| i.vars.iter())
+            .chain(non_specific_currents.iter())
+            .map(|v| v.name.to_string())
+            .chain(KNOWN.iter().map(|p| p.0.to_string()))
+            .collect::<Vec<_>>();
+
         let mut ranges = nrn.ranges.clone();
         let globals = nrn.globals.clone();
 
         let states = module.states.clone();
         // STATE and ions are module local anyhow.
         ranges.retain(|r| !states.iter().any(|s| &s.name == r));
-        ranges.retain(|r| !ions.iter().any(|s| &s.name == r));
+        ranges.retain(|r| !builtins.contains(r));
 
         let initial = match &module.initial[..] {
             [] => {
@@ -156,12 +175,24 @@ impl Module {
         }
 
         let derivatives = module.derivatives.clone();
-        let assigned = module.assigned.clone();
+
+        let assigned = module
+            .assigned
+            .iter()
+            .filter(|v| !builtins.contains(&v.name))
+            .cloned()
+            .collect::<Vec<_>>();
+
         let units = module.units.clone();
         let constants = module.constants.clone();
         let functions = module.functions.clone();
         let procedures = module.procedures.clone();
-        let parameters = module.parameters.clone();
+        let parameters = module
+            .parameters
+            .iter()
+            .filter(|v| !builtins.contains(&v.name))
+            .cloned()
+            .collect::<Vec<_>>();
         let kinetics = module.kinetics.clone();
         let linears = module.linears.clone();
 
@@ -193,6 +224,137 @@ impl Module {
         check_scopes(&res)?;
 
         Ok(res)
+    }
+
+    /// An aggressive pass to remove STATE and ASSIGNED that are never read, but
+    /// may possibly be written. This will emit warnings if variables of type
+    /// STATE / ASSIGNED are
+    ///
+    /// 1. defined, but never assigned (initialized)
+    /// 2. defined and initialized, but not updated in BREAKPOINT
+    /// 3. defined, initialized, and updated, but never read again
+    ///
+    /// If set to aggressive, it will _remove_ items under 3. This behaviour can
+    /// interfere with observability, though.
+    pub fn eliminate_dead_state(mut self) -> Result<Self> {
+        // First, check all STATE is initialized
+        let initialized = self
+            .initial
+            .as_ref()
+            .map(|i| i.uses())
+            .unwrap_or(Inventory::new());
+        for state in &self.states {
+            let state = &state.name;
+            if initialized.is_written(&state).is_none() {
+                eprintln!("Warning: STATE variable {state} is not initialized in INITIAL block.");
+            }
+        }
+
+        let mut usage = self
+            .breakpoint
+            .as_ref()
+            .map(|i| i.uses())
+            .unwrap_or(Inventory::new());
+        usage.merge(
+            &self
+                .net_receive
+                .as_ref()
+                .map(|i| i.uses())
+                .unwrap_or(Inventory::new()),
+        );
+        for blk in &self.kinetics {
+            usage.merge(&blk.uses());
+        }
+        for blk in &self.derivatives {
+            usage.merge(&blk.uses());
+        }
+
+        for state in &self.states {
+            let state = &state.name;
+            if usage.is_written(&state).is_none()
+                && usage.is_written(&format!("{state}'")).is_none()
+            {
+                eprintln!("Warning: STATE variable {state} is never updated in any BREAKPOINT/NET_RECEIVE/KINETIC/DERIVATIVE block.");
+            }
+        }
+
+        let mut to_remove = Set::new();
+        for state in &self.states {
+            let state = &state.name;
+            if usage.is_read(&state).is_none() && usage.is_read(&format!("{state}'")).is_none() {
+                if initialized.is_read(&state).is_none() {
+                    to_remove.insert(state.to_string());
+                } else {
+                    eprintln!("Warning: STATE variable {state} is never consumed in any BREAKPOINT/NET_RECEIVE/KINETIC/DERIVATIVE block; however it is used in INITIAL.");
+                }
+            }
+        }
+        // At this point, we know we can strip all uses of `state` in the module.
+        fn strip_writes(
+            blk: &mut Block,
+            to_remove: &Set<String>,
+            locals: &mut Vec<String>,
+        ) -> Result<()> {
+            locals.extend(blk.locals.iter().map(|v| v.name.to_string()));
+            let mut new = Vec::new();
+            for stmnt in blk.stmnts.iter() {
+                match &stmnt.data {
+                    StatementT::Assign(lhs, _)
+                        if to_remove.contains(lhs) && !locals.contains(&lhs) => {}
+                    StatementT::Block(inner) => {
+                        let mut inner = inner.clone();
+                        strip_writes(&mut inner, to_remove, locals)?;
+                        new.push(Statement::block(inner));
+                    }
+                    StatementT::IfThenElse(c, t, Some(e)) => {
+                        let mut t = t.clone();
+                        strip_writes(&mut t, to_remove, locals)?;
+                        let mut e = e.clone();
+                        strip_writes(&mut e, to_remove, locals)?;
+                        new.push(Statement::if_then_else(c.clone(), t, Some(e), stmnt.loc));
+                    }
+                    StatementT::IfThenElse(c, t, None) => {
+                        let mut t = t.clone();
+                        strip_writes(&mut t, to_remove, locals)?;
+                        new.push(Statement::if_then_else(c.clone(), t, None, stmnt.loc));
+                    }
+                    _ => new.push(stmnt.clone()),
+                }
+            }
+            blk.stmnts = new;
+            // strip back locals
+            for _ in &blk.locals {
+                locals
+                    .pop()
+                    .expect("Impossible: left with less locals than we started with");
+            }
+            Ok(())
+        }
+        // We also know that these can at most be assignments like `state = ...`
+        self.states.retain(|v| !to_remove.contains(&v.name));
+        for blk in &mut [
+            &mut self.initial,
+            &mut self.breakpoint,
+            &mut self.net_receive,
+        ] {
+            if let Some(blk) = blk {
+                strip_writes(&mut blk.body, &to_remove, &mut Vec::new())?;
+            }
+        }
+
+        for procs in &mut [
+            &mut self.kinetics,
+            &mut self.derivatives,
+            &mut self.procedures,
+            &mut self.functions,
+            &mut self.linears,
+        ] {
+            for proc in procs.iter_mut() {
+                strip_writes(&mut proc.body, &to_remove, &mut Vec::new())?;
+            }
+        }
+
+        Ok(self)
     }
 
     pub fn eliminate_dead_blocks(mut self) -> Result<Self> {
@@ -294,13 +456,13 @@ impl Module {
 
         for blk in &mut [&mut self.derivatives, &mut self.kinetics] {
             for symbol in blk.iter_mut() {
-                inline_into_block(&mut symbol.body, &procs)?;
+                symbol.body = inline_procedure_into_block(&symbol.body, &procs)?;
             }
         }
 
         for blk in &mut [&mut self.initial, &mut self.breakpoint] {
             if let Some(ref mut proc) = blk {
-                inline_into_block(&mut proc.body, &procs)?;
+                proc.body = inline_procedure_into_block(&mut proc.body, &procs)?;
             }
         }
 
@@ -329,16 +491,41 @@ impl Module {
 
         for blk in &mut [&mut self.derivatives, &mut self.kinetics] {
             for symbol in blk.iter_mut() {
-                inline_into_block(&mut symbol.body, &procs)?;
+                symbol.body = inline_function_into_block(&mut symbol.body, &procs)?;
             }
         }
 
         for blk in [&mut self.initial, &mut self.breakpoint].iter_mut() {
             if let Some(ref mut proc) = blk {
-                inline_into_block(&mut proc.body, &procs)?;
+                proc.body = inline_function_into_block(&mut proc.body, &procs)?;
             }
         }
 
+        // No need for FUNCTIONs any more; built-ins are covered elsewhere
+        self.functions.clear();
+
+        Ok(self)
+    }
+
+    pub fn solve_odes(mut self) -> Result<Self> {
+        if let Some(ref mut proc) = self.breakpoint {
+            for stmnt in proc.body.stmnts.iter_mut() {
+                if let StatementT::Solve(ds, method) = &stmnt.data {
+                    let ds = self.derivatives.iter()
+                                             .find(|p| &p.name == ds)
+                                             .ok_or(ModcxxError::UnboundName(ds.to_string(), stmnt.loc))?;
+                    let new = match method {
+                        SolveT::Default => cnexp(&ds.body)?,
+                        SolveT::Method(m) if m == "cnexp" => cnexp(&ds.body)?,
+                        SolveT::Method(_) => todo!(),
+                        SolveT::SteadyState(_) => todo!(),
+                    };
+                    *stmnt = Statement::block(new);
+                }
+            }
+        }
+        // We solved all of them, right?
+        self.derivatives.clear();
         Ok(self)
     }
 
@@ -490,10 +677,7 @@ impl Module {
                     StatementT::IfThenElse(_, ref mut t, None) => {
                         do_inline(t, inlinable)?;
                     }
-                    StatementT::Call(Expression {
-                        data: ExpressionT::Call(nm, _),
-                        ..
-                    }) if inlinable.contains_key(nm) => {
+                    StatementT::Call(nm, _) if inlinable.contains_key(nm) => {
                         *stmnt = Statement::block(inlinable[nm].clone());
                     }
                     StatementT::Solve(nm, _) if inlinable.contains_key(nm) => {
@@ -620,7 +804,7 @@ impl Module {
                         }
                     }
                     StatementT::Return(_) => unreachable!(), // we don't handle FUNCTION
-                    StatementT::Call(_) => unreachable!(),   // we have already inlined all of these
+                    StatementT::Call(_, _) => unreachable!(), // we have already inlined all of these
                     StatementT::Solve(_, _) => unreachable!(), // we have already inlined all of these
                     StatementT::Initial(_) => unreachable!(),  // Not supported
                     StatementT::Conserve(lhs, rhs) => {
@@ -689,29 +873,36 @@ impl Module {
             .filter_map(|nm| {
                 accesses
                     .iter()
-                    .all(|tab|matches!(tab.get(&nm.name), None | Some(Action::WR) | Some(Action::W)))
+                    .all(|tab| {
+                        matches!(tab.get(&nm.name), None | Some(Action::WR) | Some(Action::W))
+                    })
                     .then_some(nm.name.to_string())
             })
             .collect::<Set<_>>();
-        eprintln!("Can localize: {localize:?}");
         self.assigned.retain(|v| !localize.contains(&v.name));
-
         for blk in &mut [
             &mut self.initial,
             &mut self.net_receive,
             &mut self.breakpoint,
         ] {
             if let Some(ref mut blk) = blk {
-                let uses = blk.uses();
                 for local in localize.iter() {
-                    if uses.is_read_kind(local, usr::Kind::Global).is_some() {
-                        blk.data
-                            .body
-                            .data
-                            .locals
-                            .push(Variable::local(local, blk.loc));
-                    }
+                    blk.data
+                        .body
+                        .data
+                        .locals
+                        .push(Variable::local(local, blk.loc));
                 }
+            }
+        }
+
+        for blk in self.derivatives.iter_mut() {
+            for local in localize.iter() {
+                blk.data
+                    .body
+                    .data
+                    .locals
+                    .push(Variable::local(local, blk.loc));
             }
         }
 
@@ -724,6 +915,48 @@ impl Module {
             self.derivatives.push(der);
         }
         self.kinetics = Vec::new();
+        Ok(self)
+    }
+
+    pub fn alphatize(mut self) -> Result<Self> {
+        let mut globals = Map::new();
+        for v in self
+            .states
+            .iter()
+            .chain(self.assigned.iter())
+            .chain(self.parameters.iter())
+            .chain(self.ions.iter().flat_map(|ion| ion.vars.iter()))
+        {
+            if let Some(loc) = globals.get(&v.name) {
+                return Err(ModcxxError::DuplicateSymbol(
+                    v.name.to_string(),
+                    v.loc,
+                    *loc,
+                ));
+            }
+            globals.insert(v.name.to_string(), v.loc);
+        }
+
+        fn do_alphatize(blk: &mut Block, names: &Map<String, Location>) -> Result<()> {
+            let mut names = names.clone();
+            let mut lut = Map::new();
+            for v in &blk.data.locals {
+                if names.contains_key(&v.name) {
+                    lut.insert(
+                        v.name.to_string(),
+                        format!("{}_{}_{}_", v.name, v.loc.line, v.loc.column),
+                    );
+                }
+                names.insert(v.name.to_string(), v.loc);
+            }
+            *blk = blk.rename_all(&lut)?;
+            Ok(())
+        }
+
+        if let Some(ref mut blk) = self.initial {
+            do_alphatize(&mut blk.body, &globals)?;
+        }
+
         Ok(self)
     }
 
@@ -779,16 +1012,13 @@ impl Module {
     /// 1. writing to a variable that is never read
     /// 2. an empty block (although we should have collapsed those already)
     /// 3. a bare call to a function or procedure that has no effect
-    pub fn eliminate_dead_statements(mut self) -> Result<Self> {
+    pub fn eliminate_dead_calls(mut self) -> Result<Self> {
         fn eliminate_bare_calls(functions: &Set<String>, blk: &Block) -> Result<Block> {
             let mut res = blk.clone();
             res.stmnts.clear();
             for stmnt in blk.stmnts.iter() {
                 match &stmnt.data {
-                    StatementT::Call(Expression {
-                        data: ExpressionT::Call(ref nm, _),
-                        ..
-                    }) if functions.contains(nm) => continue,
+                    StatementT::Call(ref nm, _) if functions.contains(nm) => continue,
                     StatementT::Block(blk) => {
                         res.stmnts
                             .push(Statement::block(eliminate_bare_calls(functions, blk)?));
@@ -829,51 +1059,310 @@ impl Module {
 
         Ok(self)
     }
-}
 
-fn inline_into_block(blk: &mut Block, procs: &Map<String, (Vec<String>, Block)>) -> Result<()> {
-    let mut depth = 0;
-    loop {
-        let mut new = blk.clone();
-        for stmnt in new.stmnts.iter_mut() {
-            match stmnt.data {
-                StatementT::Call(Expression {
-                    data: ExpressionT::Call(ref cname, ref cargs),
-                    loc,
-                }) => {
-                    if let Some((pargs, pbody)) = procs.get(cname) {
-                        let mut new = Statement::block(pbody.clone());
-                        let lut = pbody
-                            .locals
-                            .iter()
-                            .map(|l| {
-                                (
-                                    l.name.clone(),
-                                    format!("{}_{}_{}", l.name, loc.line, loc.column),
-                                )
-                            })
-                            .collect::<Map<String, String>>();
-                        new = new.rename_all(&lut)?;
-                        for (f, t) in pargs.iter().zip(cargs.iter()) {
-                            new = new.substitute(&ExpressionT::Variable(f.to_string()), t)?
+    /// This is a global pass as we need to ensure that _outputs_ are properly
+    /// preserved.
+    pub fn eliminate_dead_local_assignments(mut self) -> Result<Self> {
+        if !self.kinetics.is_empty() {
+            return Err(ModcxxError::InternalError(
+                "Dead assignments must run after KINETIC -> SPARSE elaboration".to_string(),
+            ));
+        }
+        if !self.procedures.is_empty() {
+            return Err(ModcxxError::InternalError(
+                "Dead assignments must run after PROCEDURE inlining".to_string(),
+            ));
+        }
+
+        fn is_first_read_in(var: &str, stmnts: &[Statement]) -> Result<bool> {
+            for stmnt in stmnts {
+                match &stmnt.data {
+                    StatementT::Assign(lhs, rhs) => {
+                        if rhs.uses().is_read(var).is_some() {
+                            return Ok(true);
                         }
-                        *stmnt = new;
+                        if lhs == var {
+                            return Ok(false);
+                        }
+                    }
+                    StatementT::Return(exp) => {
+                        if exp.uses().is_read(var).is_some() {
+                            return Ok(true);
+                        }
+                    }
+                    StatementT::Conserve(lhs, rhs) => {
+                        if lhs.uses().is_used(var) {
+                            return Ok(true);
+                        }
+                        if rhs.uses().is_used(var) {
+                            return Ok(true);
+                        }
+                    }
+                    StatementT::Linear(lhs, rhs) => {
+                        if lhs.uses().is_used(var) {
+                            return Ok(true);
+                        }
+                        if rhs.uses().is_used(var) {
+                            return Ok(true);
+                        }
+                    }
+                    StatementT::Derivative(lhs, rhs) => {
+                        if rhs.uses().is_used(var) {
+                            return Ok(true);
+                        }
+                        if &format!("{var}'") == lhs {
+                            return Ok(false);
+                        }
+                    }
+                    StatementT::Solve(_, _) => {}
+                    StatementT::IfThenElse(c, t, e) => {
+                        if c.uses().is_read(var).is_some() {
+                            return Ok(true);
+                        }
+                        if is_first_read_in(var, &t.data.stmnts)? {
+                            return Ok(true);
+                        }
+                        if let Some(e) = e {
+                            if is_first_read_in(var, &e.data.stmnts)? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    StatementT::Block(blk) => {
+                        if is_first_read_in(var, &blk.data.stmnts)? {
+                            return Ok(true);
+                        }
+                    }
+                    StatementT::Call(_, args) => {
+                        if args.iter().any(|exp| exp.uses().is_read(var).is_some()) {
+                            return Ok(true);
+                        }
+                    }
+                    StatementT::Rate(_, _, _, _) => {
+                        return Err(ModcxxError::InternalError(
+                            "Dataflow called before KINETIC -> SPARSE elaboration".to_string(),
+                        ));
+                    }
+                    StatementT::Initial(_) => {
+                        return Err(ModcxxError::InternalError(
+                            "Dataflow called on invalid AST".to_string(),
+                        ));
                     }
                 }
-                StatementT::Block(ref mut blk) => inline_into_block(blk, procs)?,
-                _ => {}
             }
+            Ok(false)
         }
-        if new == *blk {
+
+        fn strip(blk: &mut Block) -> Result<()> {
+            let mut new = Vec::new();
+            for (ix, stmnt) in blk.stmnts.iter().enumerate() {
+                if let StatementT::Assign(lhs, _) = &stmnt.data {
+                    if blk.locals.iter().any(|v| &v.name == lhs)
+                        && !is_first_read_in(lhs, &blk.stmnts[ix + 1..])?
+                    {
+                        continue;
+                    }
+                }
+                new.push(stmnt.clone());
+            }
+            blk.stmnts = new;
+            Ok(())
+        }
+
+        if let Some(ref mut blk) = self.initial {
+            strip(&mut blk.body)?;
+        }
+
+        if let Some(ref mut blk) = self.breakpoint {
+            strip(&mut blk.body)?;
+        }
+
+        if let Some(ref mut blk) = self.net_receive {
+            strip(&mut blk.body)?;
+        }
+
+        for blk in self.derivatives.iter_mut() {
+            strip(&mut blk.body)?;
+        }
+
+        Ok(self)
+    }
+}
+
+/// Given a function body, its dummy args, and the actual arguments;
+/// produce a block to effectively inline the function. If a `return`
+/// statement is included, replace it with an assignment to
+/// `function-name_line-of-call-col-of-call`.
+fn inline_body(
+    name: &str,
+    dummy: &[String],
+    body: &Block,
+    args: &[Expression],
+    loc: Location,
+) -> Result<Statement> {
+    let lut = body
+        .locals
+        .iter()
+        .map(|l| {
+            (
+                l.name.clone(),
+                format!("{}_{}_{}", l.name, loc.line, loc.column),
+            )
+        })
+        .collect::<Map<String, String>>();
+    let mut body = Statement::block(body.clone());
+    let mut extra_locals = Set::new();
+    body = body.substitute_if(&mut |s: &Statement| {
+        if let StatementT::Return(rhs) = &s.data {
+            let local = format!("call_{name}_{}_{}", loc.line, loc.column);
+            extra_locals.insert(local.clone());
+            Some(Statement::assign(&local, rhs.clone(), s.loc))
+        } else {
+            None
+        }
+    })?;
+    let StatementT::Block(ref mut inner) = &mut body.data else {
+        unreachable!();
+    };
+    inner
+        .locals
+        .extend(extra_locals.iter().map(|n| Symbol::local(n, body.loc)));
+    body = body.rename_all(&lut)?;
+    for (f, t) in dummy.iter().zip(args.iter()) {
+        body = body.substitute(&ExpressionT::Variable(f.to_string()), t)?;
+    }
+
+    Ok(body)
+}
+
+fn inline_procedure_into_block(
+    blk: &Block,
+    procs: &Map<String, (Vec<String>, Block)>,
+) -> Result<Block> {
+    let mut depth = 0;
+    let mut blk = blk.clone();
+    loop {
+        let mut new = Vec::new();
+        for stmnt in blk.stmnts.iter() {
+            let loc = stmnt.loc;
+            let stmnt = match &stmnt.data {
+                StatementT::Call(cname, cargs) if procs.contains_key(cname) => {
+                    let (pargs, pbody) = &procs[cname];
+                    inline_body(cname, pargs, pbody, cargs, loc)?
+                }
+                StatementT::IfThenElse(c, t, e) => {
+                    let t = inline_procedure_into_block(&t, procs)?;
+                    let e = if let Some(e) = e {
+                        Some(inline_procedure_into_block(e, procs)?)
+                    } else {
+                        None
+                    };
+                    Statement::if_then_else(c.clone(), t, e, loc)
+                }
+                StatementT::Block(blk) => {
+                    Statement::block(inline_procedure_into_block(&blk, procs)?)
+                }
+                _ => stmnt.clone(),
+            };
+            new.push(stmnt);
+        }
+        if new == blk.stmnts {
             break;
         }
         if depth > 10 {
             unimplemented!(); // Recursion depth!
         }
-        *blk = new;
+        blk.stmnts = new;
         depth += 1;
     }
-    Ok(())
+    Ok(blk)
+}
+
+fn inline_function_into_block(
+    blk: &Block,
+    procs: &Map<String, (Vec<String>, Block)>,
+) -> Result<Block> {
+    let mut depth = 0;
+    let mut blk = blk.clone();
+    loop {
+        let mut new = Vec::new();
+        for stmnt in blk.stmnts.iter() {
+            let mut pred = |ex: &Expression| {
+                if let ExpressionT::Call(f, args) = &ex.data {
+                    if let Some((dummy, body)) = procs.get(f) {
+                        new.push(inline_body(f, dummy, body, args, ex.loc).unwrap());
+                        Some(Expression::variable(
+                            &format!("call_{f}_{}_{}", ex.loc.line, ex.loc.column),
+                            ex.loc,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            let loc = stmnt.loc;
+            match &stmnt.data {
+                StatementT::Assign(lhs, rhs) => {
+                    let rhs = rhs.substitute_if(&mut pred)?;
+                    new.push(Statement::assign(lhs, rhs, loc));
+                }
+                StatementT::IfThenElse(c, t, e) => {
+                    let c = c.substitute_if(&mut pred)?;
+                    let t = inline_function_into_block(t, procs)?;
+                    let e = if let Some(e) = e {
+                        Some(inline_function_into_block(e, procs)?)
+                    } else {
+                        None
+                    };
+                    new.push(Statement::if_then_else(c, t, e, loc));
+                }
+                StatementT::Derivative(lhs, rhs) => {
+                    let rhs = rhs.substitute_if(&mut pred)?;
+                    new.push(Statement::derivative(lhs, rhs, loc));
+                }
+                StatementT::Return(rhs) => {
+                    let rhs = rhs.substitute_if(&mut pred)?;
+                    new.push(Statement::ret(rhs, loc));
+                }
+                StatementT::Conserve(lhs, rhs) => {
+                    let lhs = lhs.substitute_if(&mut pred)?;
+                    let rhs = rhs.substitute_if(&mut pred)?;
+                    new.push(Statement::conserve(lhs, rhs, loc));
+                }
+                StatementT::Rate(lhs, rhs, fwd, bwd) => {
+                    let lhs = lhs.substitute_if(&mut pred)?;
+                    let rhs = rhs.substitute_if(&mut pred)?;
+                    let fwd = fwd.substitute_if(&mut pred)?;
+                    let bwd = bwd.substitute_if(&mut pred)?;
+                    new.push(Statement::rate(lhs, rhs, fwd, bwd, loc));
+                }
+                StatementT::Linear(lhs, rhs) => {
+                    let lhs = lhs.substitute_if(&mut pred)?;
+                    let rhs = rhs.substitute_if(&mut pred)?;
+                    new.push(Statement::linear(lhs, rhs, loc));
+                }
+                StatementT::Initial(inner) => new.push(Statement::initial(
+                    inline_function_into_block(&inner, procs)?,
+                    loc,
+                )),
+                StatementT::Block(inner) => {
+                    new.push(Statement::block(inline_function_into_block(&inner, procs)?))
+                }
+                StatementT::Call(_, _) | StatementT::Solve(_, _) => new.push(stmnt.clone()),
+            }
+        }
+        if new == blk.stmnts {
+            break;
+        }
+        if depth > 10 {
+            unimplemented!(); // Recursion depth!
+        }
+        blk.stmnts = new;
+        depth += 1;
+    }
+    Ok(blk)
 }
 
 fn check_duplicates_and_keywords(module: &Module) -> Result<()> {
@@ -1034,9 +1523,13 @@ fn check_scopes(module: &Module) -> Result<()> {
         for var in &ion.vars {
             globals.insert(var.name.to_string(), var.access);
         }
-        if let Some(Expression { data: ExpressionT::Variable(v), .. }) = &ion.vale {
+        if let Some(Expression {
+            data: ExpressionT::Variable(v),
+            ..
+        }) = &ion.vale
+        {
             globals.insert(v.to_string(), Access::RO);
-        } 
+        }
     }
 
     let mut funcs = FUNCTIONS
@@ -1382,6 +1875,7 @@ fn kinetic_to_sparse(kin: Callable) -> Result<Callable> {
     Ok(Callable::procedure(&kin.name, &[], None, body, kin.loc))
 }
 
+
 impl Simplify for Module {
     fn simplify(&self) -> Result<Self> {
         let mut res = self.clone();
@@ -1406,7 +1900,10 @@ impl Simplify for Module {
 
 #[cfg(test)]
 mod tests {
+    use crate::{ast, nmd::to_nmodl};
+
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_arity() {
@@ -1533,10 +2030,258 @@ FUNCTION foo() {
 ",
         )
         .unwrap();
-        let m = Module::new(&s)
-            .unwrap()
-            .eliminate_dead_statements()
-            .unwrap();
+        let m = Module::new(&s).unwrap().eliminate_dead_calls().unwrap();
         assert!(m.breakpoint.unwrap().body.data.stmnts.is_empty());
+    }
+
+    #[test]
+    fn inline_function() {
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+STATE { s }
+
+BREAKPOINT { s = foo() }
+
+FUNCTION foo() {
+  foo = 42
+}
+",
+        )
+        .unwrap();
+        let s = &ast::Module::new(&s)
+            .unwrap()
+            .inline_functions()
+            .unwrap()
+            .splat_blocks()
+            .unwrap()
+            .breakpoint
+            .unwrap()
+            .body;
+
+        assert_eq!(
+            s.locals,
+            vec![Symbol::local(
+                "call_foo_7_17",
+                Location {
+                    line: 9,
+                    column: 15,
+                    position: 91
+                }
+            ),]
+        );
+        assert_eq!(
+            s.stmnts.last().unwrap(),
+            &Statement::assign(
+                "s",
+                Expression::variable(
+                    "call_foo_7_17",
+                    Location {
+                        line: 7,
+                        column: 17,
+                        position: 67
+                    }
+                ),
+                Location {
+                    line: 7,
+                    column: 15,
+                    position: 65
+                }
+            )
+        );
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+STATE { s }
+
+BREAKPOINT { s = foo(2) * foo(1) }
+
+FUNCTION foo(n) {
+  foo = n + 42
+}
+",
+        )
+        .unwrap();
+        let s = &ast::Module::new(&s)
+            .unwrap()
+            .inline_functions()
+            .unwrap()
+            .splat_blocks()
+            .unwrap()
+            .breakpoint
+            .unwrap()
+            .body;
+
+        assert_eq!(
+            s.locals,
+            vec![
+                Symbol::local(
+                    "call_foo_7_17",
+                    Location {
+                        line: 9,
+                        column: 16,
+                        position: 102
+                    }
+                ),
+                Symbol::local(
+                    "call_foo_7_26",
+                    Location {
+                        line: 9,
+                        column: 16,
+                        position: 102
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            s.stmnts.last().unwrap(),
+            &Statement::assign(
+                "s",
+                Expression::mul(
+                    Expression::variable(
+                        "call_foo_7_17",
+                        Location {
+                            line: 7,
+                            column: 17,
+                            position: 67
+                        }
+                    ),
+                    Expression::variable(
+                        "call_foo_7_26",
+                        Location {
+                            line: 7,
+                            column: 26,
+                            position: 76
+                        }
+                    ),
+                    Location {
+                        line: 7,
+                        column: 24,
+                        position: 74
+                    }
+                ),
+                Location {
+                    line: 7,
+                    column: 15,
+                    position: 65
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn cnexp_solver() {
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+STATE { s }
+
+BREAKPOINT { SOLVE dS METHOD cnexp }
+
+DERIVATIVE dS {
+  s' = 42*s + 23
+}
+",
+        )
+        .unwrap();
+        let s = &ast::Module::new(&s)
+            .unwrap()
+            .solve_odes()
+            .unwrap()
+            .splat_blocks()
+            .unwrap();
+        assert_eq!(s.breakpoint.unwrap().body.stmnts.last(),
+                   Statement::assign("s", Expression::neg(Expression::variable("ba_",
+                                                                               Location { line: 0, column: 0, position: 0 }),
+                                                          Location { line: 0, column: 0, position: 0 }),
+                                     Location { line: 0, column: 0, position: 0 }),
+        );
+
+        
+        let t = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+STATE { s }
+
+BREAKPOINT { SOLVE dS }
+
+DERIVATIVE dS {
+  s' = 42*s + 23
+}
+").unwrap();
+        let t = &ast::Module::new(&t)
+            .unwrap()
+            .solve_odes()
+            .unwrap()
+            .splat_blocks()
+            .unwrap();
+        assert_eq!(t, s);
+
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+STATE { s }
+
+BREAKPOINT { SOLVE dS METHOD cnexp }
+
+DERIVATIVE dS {
+  LOCAL x, y
+  x = 23
+  y = 42
+  s' = y*s + x
+}
+",
+        )
+        .unwrap();
+        let s = &ast::Module::new(&s)
+            .unwrap()
+            .solve_odes()
+            .unwrap()
+            .splat_blocks()
+            .unwrap();
+        eprintln!("{}", to_nmodl(s).unwrap());
+
+        let s = par::parse(
+            "
+NEURON { SUFFIX test }
+
+INITIAL {}
+
+STATE { s t }
+
+BREAKPOINT { SOLVE dS METHOD cnexp }
+
+DERIVATIVE dS {
+  LOCAL x, y, u, w
+  x = 23
+  y = 42
+  s' = y*s + x
+  t' = u*t + v
+}
+",
+        )
+        .unwrap();
+        let s = &ast::Module::new(&s)
+            .unwrap()
+            .solve_odes()
+            .unwrap()
+            .splat_blocks()
+            .unwrap();
+        eprintln!("{}", to_nmodl(s).unwrap());
     }
 }

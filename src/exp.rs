@@ -1,8 +1,10 @@
+use crate::usr::{self, Inventory};
+use crate::{err::Result, loc::Location, usr::Uses, Map, Set};
+pub use rug::Rational;
 use std::fmt::{self, Debug};
 use std::ops::{Deref, DerefMut};
 
-use crate::usr::{self, Inventory};
-use crate::{err::Result, loc::Location, usr::Uses, Map, Set};
+pub const MAX_PRECISION: u32 = 100;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WithLocation<T: Clone + PartialEq + Eq + Debug> {
@@ -256,6 +258,10 @@ impl Statement {
         Statement::new(StatementT::Linear(lhs, rhs), loc)
     }
 
+    pub fn ret(rhs: Expression, loc: Location) -> Self {
+        Statement::new(StatementT::Return(rhs), loc)
+    }
+
     pub fn derivative(lhs: &str, rhs: Expression, loc: Location) -> Self {
         Statement::new(StatementT::Derivative(lhs.to_string(), rhs), loc)
     }
@@ -269,7 +275,7 @@ impl Statement {
     }
 
     pub fn call(fun: &str, args: Vec<Expression>, loc: Location) -> Self {
-        Statement::new(StatementT::Call(Expression::call(fun, args, loc)), loc)
+        Statement::new(StatementT::Call(fun.to_string(), args), loc)
     }
 
     pub fn substitute(&self, from: &ExpressionT, to: &ExpressionT) -> Result<Self> {
@@ -293,8 +299,10 @@ impl Statement {
                 *rhs = rhs.substitute(from, to)?;
             }
             StatementT::Block(ref mut blk) => *blk = blk.substitute(from, to)?,
-            StatementT::Call(ref mut ex) => {
-                *ex = ex.substitute(from, to)?;
+            StatementT::Call(_, ref mut args) => {
+                for ex in args.iter_mut() {
+                    *ex = ex.substitute(from, to)?;
+                }
             }
             StatementT::Conserve(ref mut lhs, ref mut rhs) => {
                 *lhs = lhs.substitute(from, to)?;
@@ -346,7 +354,7 @@ impl Statement {
                 let rhs = rhs.rename_all(lut)?;
                 Self::assign(&lhs, rhs, self.loc)
             }
-            Return(_) => todo!(),
+            Return(rhs) => Self::ret(rhs.rename_all(lut)?, self.loc),
             Conserve(lhs, rhs) => {
                 Self::conserve(lhs.rename_all(lut)?, rhs.rename_all(lut)?, self.loc)
             }
@@ -377,21 +385,53 @@ impl Statement {
                 self.loc,
             ),
             Block(blk) => Self::block(blk.rename_all(lut)?),
-            Call(Expression {
-                data: ExpressionT::Call(nm, args),
-                loc,
-            }) => {
+            Call(nm, args) => {
                 let nm = if let Some(nm) = lut.get(nm) { nm } else { nm };
                 let args = args
                     .iter()
                     .map(|a| a.rename_all(lut))
                     .collect::<Result<Vec<_>>>()?;
-                Self::call(nm, args, *loc)
+                Self::call(nm, args, self.loc)
             }
             Initial(blk) => Self::initial(blk.rename_all(lut)?, self.loc),
             _ => unreachable!(),
         };
         Ok(res)
+    }
+
+    pub fn substitute_if<F>(&self, pred: &mut F) -> Result<Self>
+    where
+        F: FnMut(&Statement) -> Option<Statement>,
+    {
+        if let Some(new) = pred(self) {
+            return Ok(new);
+        }
+        match &self.data {
+            StatementT::IfThenElse(c, t, e) => {
+                let mut t = t.clone();
+                for stmnt in t.stmnts.iter_mut() {
+                    *stmnt = stmnt.substitute_if(pred)?;
+                }
+                let e = if let Some(e) = e {
+                    let mut e = e.clone();
+                    for stmnt in e.stmnts.iter_mut() {
+                        *stmnt = stmnt.substitute_if(pred)?;
+                    }
+                    Some(e)
+                } else {
+                    None
+                };
+                return Ok(Statement::if_then_else(c.clone(), t, e, self.loc));
+            }
+            StatementT::Block(inner) => {
+                let mut inner = inner.clone();
+                for stmnt in inner.stmnts.iter_mut() {
+                    *stmnt = stmnt.substitute_if(pred)?;
+                }
+                return Ok(Statement::block(inner));
+            }
+            _ => return Ok(self.clone()),
+        }
     }
 }
 
@@ -423,10 +463,21 @@ impl Uses for Statement {
                     res.0.entry(k).or_default().merge(&v);
                 }
             }
-            StatementT::Call(call) => {
-                for (k, v) in call.uses().into_iter() {
-                    res.0.entry(k).or_default().merge(&v);
+            StatementT::Call(fun, args) => {
+                for e in args {
+                    for (k, v) in e.uses().into_iter() {
+                        res.0.entry(k).or_default().merge(&v);
+                    }
                 }
+                res.0
+                    .entry(fun.to_string())
+                    .or_default()
+                    .calls
+                    .push(usr::Use {
+                        args: args.len(),
+                        src: self.loc,
+                        kind: usr::Kind::Global,
+                    });
             }
             StatementT::Initial(blk) | StatementT::Block(blk) => {
                 for (k, v) in blk.uses().into_iter() {
@@ -516,8 +567,8 @@ pub enum StatementT {
     IfThenElse(Expression, Block, Option<Block>),
     Block(Block),
     Solve(String, SolveT),
-    Call(Expression), // This feels redundant
-    Initial(Block),   // This is _only_ ever for NET_RECEIVE... I hate NMODL
+    Call(String, Vec<Expression>),
+    Initial(Block), // This is _only_ ever for NET_RECEIVE... I hate NMODL
 }
 
 pub type Expression = WithLocation<ExpressionT>;
@@ -538,10 +589,20 @@ impl Expression {
         )
     }
 
+    pub fn div(lhs: Expression, rhs: Expression, loc: Location) -> Self {
+        Expression::new(
+            ExpressionT::Binary(Box::new(lhs), Operator::Div, Box::new(rhs)),
+            loc,
+        )
+    }
+
     pub fn neg(rhs: Expression, loc: Location) -> Self {
         Expression::new(ExpressionT::Unary(Operator::Neg, Box::new(rhs)), loc)
     }
 
+    pub fn not(rhs: Expression, loc: Location) -> Self {
+        Expression::new(ExpressionT::Unary(Operator::Not, Box::new(rhs)), loc)
+    }
     pub fn pow(lhs: Expression, rhs: Expression, loc: Location) -> Self {
         Expression::new(
             ExpressionT::Binary(Box::new(lhs), Operator::Pow, Box::new(rhs)),
@@ -556,8 +617,25 @@ impl Expression {
         )
     }
 
+    pub fn sub(lhs: Expression, rhs: Expression, loc: Location) -> Self {
+        Expression::new(
+            ExpressionT::Binary(Box::new(lhs), Operator::Sub, Box::new(rhs)),
+            loc,
+        )
+    }
+
+    pub fn float<T>(val: T, loc: Location) -> Self
+    where
+        Rational: From<T>,
+    {
+        Expression::new(ExpressionT::Number(Rational::from(val)), loc)
+    }
+
     pub fn number(var: &str, loc: Location) -> Self {
-        Expression::new(ExpressionT::Number(var.to_string()), loc)
+        Expression::new(
+            ExpressionT::Number(Rational::from_f64(var.parse::<f64>().unwrap()).unwrap()),
+            loc,
+        )
     }
 
     pub fn string(var: &str, loc: Location) -> Self {
@@ -624,6 +702,33 @@ impl Expression {
         Ok(res)
     }
 
+    pub fn substitute_if<F>(&self, pred: &mut F) -> Result<Self>
+    where
+        F: FnMut(&Expression) -> Option<Expression>,
+    {
+        if let Some(new) = pred(self) {
+            Ok(new)
+        } else {
+            let mut res = self.clone();
+            match res.data {
+                ExpressionT::Binary(ref mut l, _, ref mut r) => {
+                    *l = Box::new(l.substitute_if(pred)?);
+                    *r = Box::new(r.substitute_if(pred)?);
+                }
+                ExpressionT::Unary(_, ref mut r) => {
+                    *r = Box::new(r.substitute_if(pred)?);
+                }
+                ExpressionT::Call(_, ref mut args) => {
+                    for arg in args.iter_mut() {
+                        *arg = arg.substitute_if(pred)?;
+                    }
+                }
+                ExpressionT::Variable(_) | ExpressionT::Number(_) | ExpressionT::String(_) => {}
+            }
+            Ok(res)
+        }
+    }
+
     pub fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
         use ExpressionT::*;
         let res = match &self.data {
@@ -631,13 +736,7 @@ impl Expression {
             Binary(lhs, op, rhs) => {
                 Self::binary(lhs.rename_all(lut)?, *op, rhs.rename_all(lut)?, self.loc)
             }
-            Variable(v) => {
-                if let Some(v) = lut.get(v) {
-                    Self::variable(v, self.loc)
-                } else {
-                    self.clone()
-                }
-            }
+            Variable(v) => Self::variable(lut.get(v).unwrap_or(v), self.loc),
             Number(_) => self.clone(),
             String(_) => self.clone(),
             Call(fun, args) => {
@@ -709,9 +808,9 @@ pub enum ExpressionT {
     Unary(Operator, Box<Expression>),
     Binary(Box<Expression>, Operator, Box<Expression>),
     Variable(String),
-    Number(String),
+    Number(Rational),
     String(String),
-    Call(String, Vec<Expression>), // TODO(TH): Maybe it's worth letting arbitrary expression occur in this position?!
+    Call(String, Vec<Expression>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,13 +912,10 @@ impl Symbol {
     }
 
     pub fn rename_all(&self, new: &Map<String, String>) -> Result<Self> {
-        let res = if let Some(nm) = new.get(&self.name) {
-            let mut new = self.clone();
-            new.name = nm.to_string();
-            new
-        } else {
-            self.clone()
-        };
+        let mut res = self.clone();
+        if let Some(nm) = new.get(&self.name) {
+            res.name = nm.to_string();
+        }
         Ok(res)
     }
 }

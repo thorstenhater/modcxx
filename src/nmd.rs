@@ -176,7 +176,7 @@ fn unit(ex: &ExpressionT) -> Result<String> {
                 res.push_str(var);
             }
             ExpressionT::Number(var) => {
-                res.push_str(var);
+                res.push_str(&var.to_string());
             }
             ExpressionT::Binary(lhs, op, rhs) => {
                 unit_(&lhs.data, res)?;
@@ -268,7 +268,7 @@ fn precedence_of(out: Operator) -> usize {
     }
 }
 
-fn expression(ex: &Expression) -> Result<String> {
+pub fn expression(ex: &Expression) -> Result<String> {
     expression_with_precedence(ex, Operator::Nil)
 }
 
@@ -293,7 +293,7 @@ fn expression_with_precedence(ex: &Expression, out: Operator) -> Result<String> 
                 .collect::<Result<Vec<_>>>()?
                 .join(", ")
         ),
-        ExpressionT::Number(v) => v.to_string(),
+        ExpressionT::Number(v) => v.to_f64().to_string(),
         ExpressionT::String(v) => format!(r#""{v}""#),
     };
     Ok(res)
@@ -328,7 +328,13 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
                 ));
             }
         }
-        StatementT::Call(call) => res.push(format!("{:ind$}{}", "", expression(call)?)),
+        StatementT::Call(fun, args) => res.push(format!(
+            "{fun}({})",
+            args.iter()
+                .map(expression)
+                .collect::<Result<Vec<_>>>()?
+                .join(", ")
+        )),
         StatementT::Block(blk) => {
             res.push(format!("{:ind$}{{", ""));
             let ind = ind + 2;

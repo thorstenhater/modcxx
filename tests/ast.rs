@@ -103,6 +103,8 @@ BREAKPOINT { baz = 42 }
     let new = modcxx::ast::Module::new(&raw);
     assert!(matches!(new, Err(modcxx::err::ModcxxError::CallableNotVariable(s, _)) if s == "baz"));
 
+    // TODO Busted as LOCALs are not considered by `use`
+    /*
     let src = r#"
 NEURON {
   SUFFIX foobar
@@ -117,9 +119,8 @@ baz(23)}
 
     let raw = modcxx::par::parse(src).expect("No parse");
     let new = modcxx::ast::Module::new(&raw);
-    // TODO Busted as LOCALs are not considered by `use`
-    //assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
-
+    assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
+     */
     let src = r#"
 NEURON {
   SUFFIX foobar

@@ -24,7 +24,7 @@ impl ToCxxDef for Statement {
             crate::exp::StatementT::Derivative(_, _) => todo!(),
             crate::exp::StatementT::IfThenElse(_, _, _) => todo!(),
             crate::exp::StatementT::Block(_) => todo!(),
-            crate::exp::StatementT::Call(_) => todo!(),
+            crate::exp::StatementT::Call(_, _) => todo!(),
             crate::exp::StatementT::Initial(_) => todo!(),
             crate::exp::StatementT::Linear(_, _) => todo!(),
             crate::exp::StatementT::Solve(_, _) => todo!(),

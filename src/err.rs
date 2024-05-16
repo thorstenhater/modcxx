@@ -47,6 +47,10 @@ pub enum ModcxxError {
     SolvableNotCallable(String, Location),
     #[error("ASSIGNED {0} may be used unintialised here {1:?}.")]
     UninitialisedAssigned(String, Location),
+    #[error("Tried to linearize a non-linear expression {0:?}.")]
+    NonLinear(Location),
+    #[error("SOLVE {0} METHOD cnexp was used on a non-linear expression {1:?}.")]
+    CNExpNonLinear(String, Location),
     #[error("Function/Procedure {0} expects {1} arguments, given {2} here {3:?}.")]
     WrongArity(String, usize, usize, Location),
     #[error("KINETIC block switched from reaction (~ A <-> B ...) to a normal statement here {0:?}. This is likely illformed and not what you intend.")]

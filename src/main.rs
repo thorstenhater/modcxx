@@ -26,25 +26,33 @@ enum Cmd {
 }
 
 fn simplify_module(module: &modcxx::ast::Module) -> Result<modcxx::ast::Module> {
-    let mut new = module.clone();
+    let mut new = module
+        .clone()
+        .inline_procedures()?
+        .inline_functions()?
+        .kinetic_to_sparse()?
+        .simplify()?
+        .solve_odes()?
+        .simplify()?;
     loop {
         let nxt = new
             .clone()
-            .inline_procedures()?
-            // .inline_functions()?
-            .kinetic_to_sparse()?
             .assigned_to_local()?
             .eliminate_dead_blocks()?
             .splat_blocks()?
             .eliminate_dead_globals()?
-            .eliminate_dead_locals()?
-            .eliminate_dead_statements()?
+            .eliminate_dead_calls()?
+            .eliminate_dead_local_assignments()?
+            .eliminate_dead_state()?
             .simplify()?;
         if nxt == new {
             break;
         }
         new = nxt;
+        // break;
     }
+    // final clean up
+    let new = new.eliminate_dead_locals()?;
     Ok(new)
 }
 

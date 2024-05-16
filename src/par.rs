@@ -76,7 +76,7 @@ pub struct Neuron {
 }
 
 pub struct Parser {
-    lexer: Lexer,
+    pub lexer: Lexer,
 }
 
 impl Parser {
@@ -210,7 +210,13 @@ impl Parser {
             }
         }
         self.expect(RightBrace)?;
-        Ok((self::Units {names: units, definitions: defs} , consts))
+        Ok((
+            self::Units {
+                names: units,
+                definitions: defs,
+            },
+            consts,
+        ))
     }
 
     /// Parse INDEPENDENT blocks
@@ -546,7 +552,6 @@ impl Parser {
         fn patch_stmnt(stmnt: &mut Statement, name: &str) {
             match &mut stmnt.data {
                 StatementT::Assign(lhs, rhs) if lhs == name => {
-                    eprintln!("Replacing {lhs} = ... with return.");
                     stmnt.data = StatementT::Return(rhs.clone());
                 }
                 StatementT::IfThenElse(_, t, e) => {
@@ -1107,9 +1112,22 @@ na READ
         let exp = vec![Ion {
             name: String::from("na"),
             vars: vec![],
-            vale: Some(Expression::unary(Operator::Neg,
-                                         Expression::number("42", Location { line: 0, column: 40, position: 40 }),
-                                         Location { line: 0, column: 39, position: 39 })),
+            vale: Some(Expression::unary(
+                Operator::Neg,
+                Expression::number(
+                    "42",
+                    Location {
+                        line: 0,
+                        column: 40,
+                        position: 40,
+                    },
+                ),
+                Location {
+                    line: 0,
+                    column: 39,
+                    position: 39,
+                },
+            )),
         }];
         assert_eq!(
             parse("NEURON{SUFFIX foobar USEION na VALENCE -42}")
@@ -1123,9 +1141,22 @@ na READ
         let exp = vec![Ion {
             name: String::from("na"),
             vars: vec![],
-            vale: Some(Expression::unary(Operator::Neg,
-                                         Expression::number("42", Location { line: 0, column: 44, position: 44 }),
-                                         Location { line: 0, column: 39, position: 39 })),
+            vale: Some(Expression::unary(
+                Operator::Neg,
+                Expression::number(
+                    "42",
+                    Location {
+                        line: 0,
+                        column: 44,
+                        position: 44,
+                    },
+                ),
+                Location {
+                    line: 0,
+                    column: 39,
+                    position: 39,
+                },
+            )),
         }];
         assert_eq!(
             parse("NEURON{SUFFIX foobar USEION na VALENCE -    42}")
@@ -1278,37 +1309,112 @@ BREAKPOINT {
     }
 
     #[test]
-    fn exp1() {
-        println!("{:?}", Parser::new_from_str("--42").expression().unwrap());
-        println!(
-            "{:?}",
-            Parser::new_from_str("!-(--(42))").expression().unwrap()
+    fn basic() {
+        assert_eq!(
+            Parser::new_from_str("--42").expression().unwrap(),
+            Expression::neg(
+                Expression::neg(
+                    Expression::number("42", Location::new(0, 2, 2)),
+                    Location::new(0, 1, 1)
+                ),
+                Location::new(0, 0, 0)
+            )
         );
-        println!(
-            "{:?}",
-            Parser::new_from_str("--x*42/23").expression().unwrap()
+        assert_eq!(
+            Parser::new_from_str("!-(--(42))").expression().unwrap(),
+            Expression::not(
+                Expression::neg(
+                    Expression::neg(
+                        Expression::neg(
+                            Expression::number("42", Location::new(0, 6, 6)),
+                            Location::new(0, 4, 4)
+                        ),
+                        Location::new(0, 3, 3)
+                    ),
+                    Location::new(0, 1, 1)
+                ),
+                Location::new(0, 0, 0)
+            )
         );
-        println!(
-            "{:?}",
-            Parser::new_from_str("y--x*42/23").expression().unwrap()
+
+        Parser::new_from_str("--x*42/23").expression().unwrap();
+        Parser::new_from_str("y--x*42/23").expression().unwrap();
+        Parser::new_from_str("y*z--x*42").expression().unwrap();
+        Parser::new_from_str("-x^-y*z").expression().unwrap();
+        Parser::new_from_str("sin(x)^2").expression().unwrap();
+        Parser::new_from_str("0 && 1 == 0 >= sin(x)^2")
+            .expression()
+            .unwrap();
+    }
+
+    #[test]
+    fn precedence() {
+        let exp = Parser::new_from_str("1/2/3").expression().unwrap();
+        assert_eq!(
+            exp,
+            Expression::div(
+                Expression::div(
+                    Expression::number("1", Location::new(0, 0, 0)),
+                    Expression::number("2", Location::new(0, 2, 2)),
+                    Location::new(0, 1, 1)
+                ),
+                Expression::number("3", Location::new(0, 4, 4)),
+                Location::new(0, 3, 3)
+            )
         );
-        println!(
-            "{:?}",
-            Parser::new_from_str("y*z--x*42").expression().unwrap()
+
+        let exp = Parser::new_from_str("1/(2/3)").expression().unwrap();
+        assert_eq!(
+            exp,
+            Expression::div(
+                Expression::number("1", Location::new(0, 0, 0)),
+                Expression::div(
+                    Expression::number("2", Location::new(0, 3, 3)),
+                    Expression::number("3", Location::new(0, 5, 5)),
+                    Location::new(0, 4, 4)
+                ),
+                Location::new(0, 1, 1)
+            )
         );
-        println!(
-            "{:?}",
-            Parser::new_from_str("-x^-y*z").expression().unwrap()
+        let exp = Parser::new_from_str("1-2-3").expression().unwrap();
+        assert_eq!(
+            exp,
+            Expression::sub(
+                Expression::sub(
+                    Expression::number("1", Location::new(0, 0, 0)),
+                    Expression::number("2", Location::new(0, 2, 2)),
+                    Location::new(0, 1, 1)
+                ),
+                Expression::number("3", Location::new(0, 4, 4)),
+                Location::new(0, 3, 3)
+            )
         );
-        println!(
-            "{:?}",
-            Parser::new_from_str("sin(x)^2").expression().unwrap()
+
+        let exp = Parser::new_from_str("1-(2-3)").expression().unwrap();
+        assert_eq!(
+            exp,
+            Expression::sub(
+                Expression::number("1", Location::new(0, 0, 0)),
+                Expression::sub(
+                    Expression::number("2", Location::new(0, 3, 3)),
+                    Expression::number("3", Location::new(0, 5, 5)),
+                    Location::new(0, 4, 4)
+                ),
+                Location::new(0, 1, 1)
+            )
         );
-        println!(
-            "{:?}",
-            Parser::new_from_str("0 && 1 == 0 >= sin(x)^2")
-                .expression()
-                .unwrap()
+        let exp = Parser::new_from_str("2^3^4").expression().unwrap();
+        assert_eq!(
+            exp,
+            Expression::pow(
+                Expression::number("2", Location::new(0, 0, 0)),
+                Expression::pow(
+                    Expression::number("3", Location::new(0, 2, 2)),
+                    Expression::number("4", Location::new(0, 4, 4)),
+                    Location::new(0, 3, 3)
+                ),
+                Location::new(0, 1, 1)
+            )
         );
     }
 
