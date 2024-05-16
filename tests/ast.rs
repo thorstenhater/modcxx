@@ -105,22 +105,22 @@ BREAKPOINT { baz = 42 }
 
     // TODO Busted as LOCALs are not considered by `use`
     /*
-    let src = r#"
-NEURON {
-  SUFFIX foobar
-}
+        let src = r#"
+    NEURON {
+      SUFFIX foobar
+    }
 
-PROCEDURE baz() {}
+    PROCEDURE baz() {}
 
-BREAKPOINT { LOCAL baz
-baz = 42
-baz(23)}
-"#;
+    BREAKPOINT { LOCAL baz
+    baz = 42
+    baz(23)}
+    "#;
 
-    let raw = modcxx::par::parse(src).expect("No parse");
-    let new = modcxx::ast::Module::new(&raw);
-    assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
-     */
+        let raw = modcxx::par::parse(src).expect("No parse");
+        let new = modcxx::ast::Module::new(&raw);
+        assert!(matches!(new, Err(modcxx::err::ModcxxError::VariableNotCallable(s, _)) if s == "baz"));
+         */
     let src = r#"
 NEURON {
   SUFFIX foobar

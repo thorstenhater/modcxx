@@ -1,15 +1,16 @@
 use crate::{
     err::{ModcxxError, Result},
     exp::{
-        Access, Block, Callable, Expression, ExpressionT, Operator, Statement, StatementT, Symbol,
-        Variable, SolveT
+        Access, Block, Callable, Expression, ExpressionT, Operator, SolveT, Statement, StatementT,
+        Symbol, Variable,
     },
     lex::KEYWORDS,
     loc::Location,
+    ode::cnexp,
     opt::Simplify,
     par::{self, Ion, Kind, Units},
     usr::{self, Inventory, Uses},
-    Map, Set, ode::cnexp,
+    Map, Set,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -491,13 +492,13 @@ impl Module {
 
         for blk in &mut [&mut self.derivatives, &mut self.kinetics] {
             for symbol in blk.iter_mut() {
-                symbol.body = inline_function_into_block(&mut symbol.body, &procs)?;
+                symbol.body = inline_function_into_block(&symbol.body, &procs)?;
             }
         }
 
         for blk in [&mut self.initial, &mut self.breakpoint].iter_mut() {
             if let Some(ref mut proc) = blk {
-                proc.body = inline_function_into_block(&mut proc.body, &procs)?;
+                proc.body = inline_function_into_block(&proc.body, &procs)?;
             }
         }
 
@@ -511,9 +512,11 @@ impl Module {
         if let Some(ref mut proc) = self.breakpoint {
             for stmnt in proc.body.stmnts.iter_mut() {
                 if let StatementT::Solve(ds, method) = &stmnt.data {
-                    let ds = self.derivatives.iter()
-                                             .find(|p| &p.name == ds)
-                                             .ok_or(ModcxxError::UnboundName(ds.to_string(), stmnt.loc))?;
+                    let ds = self
+                        .derivatives
+                        .iter()
+                        .find(|p| &p.name == ds)
+                        .ok_or(ModcxxError::UnboundName(ds.to_string(), stmnt.loc))?;
                     let new = match method {
                         SolveT::Default => cnexp(&ds.body)?,
                         SolveT::Method(m) if m == "cnexp" => cnexp(&ds.body)?,
@@ -1251,7 +1254,7 @@ fn inline_procedure_into_block(
                     inline_body(cname, pargs, pbody, cargs, loc)?
                 }
                 StatementT::IfThenElse(c, t, e) => {
-                    let t = inline_procedure_into_block(&t, procs)?;
+                    let t = inline_procedure_into_block(t, procs)?;
                     let e = if let Some(e) = e {
                         Some(inline_procedure_into_block(e, procs)?)
                     } else {
@@ -1260,7 +1263,7 @@ fn inline_procedure_into_block(
                     Statement::if_then_else(c.clone(), t, e, loc)
                 }
                 StatementT::Block(blk) => {
-                    Statement::block(inline_procedure_into_block(&blk, procs)?)
+                    Statement::block(inline_procedure_into_block(blk, procs)?)
                 }
                 _ => stmnt.clone(),
             };
@@ -1344,11 +1347,11 @@ fn inline_function_into_block(
                     new.push(Statement::linear(lhs, rhs, loc));
                 }
                 StatementT::Initial(inner) => new.push(Statement::initial(
-                    inline_function_into_block(&inner, procs)?,
+                    inline_function_into_block(inner, procs)?,
                     loc,
                 )),
                 StatementT::Block(inner) => {
-                    new.push(Statement::block(inline_function_into_block(&inner, procs)?))
+                    new.push(Statement::block(inline_function_into_block(inner, procs)?))
                 }
                 StatementT::Call(_, _) | StatementT::Solve(_, _) => new.push(stmnt.clone()),
             }
@@ -1875,7 +1878,6 @@ fn kinetic_to_sparse(kin: Callable) -> Result<Callable> {
     Ok(Callable::procedure(&kin.name, &[], None, body, kin.loc))
 }
 
-
 impl Simplify for Module {
     fn simplify(&self) -> Result<Self> {
         let mut res = self.clone();
@@ -2199,14 +2201,33 @@ DERIVATIVE dS {
             .unwrap()
             .splat_blocks()
             .unwrap();
-        assert_eq!(s.breakpoint.unwrap().body.stmnts.last(),
-                   Statement::assign("s", Expression::neg(Expression::variable("ba_",
-                                                                               Location { line: 0, column: 0, position: 0 }),
-                                                          Location { line: 0, column: 0, position: 0 }),
-                                     Location { line: 0, column: 0, position: 0 }),
+        assert_eq!(
+            s.breakpoint.as_ref().unwrap().body.stmnts.last().unwrap(),
+            &Statement::assign(
+                "s",
+                Expression::neg(
+                    Expression::variable(
+                        "ba_",
+                        Location {
+                            line: 0,
+                            column: 0,
+                            position: 0
+                        }
+                    ),
+                    Location {
+                        line: 0,
+                        column: 0,
+                        position: 0
+                    }
+                ),
+                Location {
+                    line: 0,
+                    column: 0,
+                    position: 0
+                }
+            ),
         );
 
-        
         let t = par::parse(
             "
 NEURON { SUFFIX test }
@@ -2220,7 +2241,9 @@ BREAKPOINT { SOLVE dS }
 DERIVATIVE dS {
   s' = 42*s + 23
 }
-").unwrap();
+",
+        )
+        .unwrap();
         let t = &ast::Module::new(&t)
             .unwrap()
             .solve_odes()

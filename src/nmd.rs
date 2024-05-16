@@ -262,7 +262,8 @@ fn precedence_of(out: Operator) -> usize {
         And | Or => 10,
         Not | LT | GT | GE | LE | Eq | NEq => 20,
         Add | Sub => 30,
-        Neg | Mul | Div => 40,
+        Neg | Mul => 40,
+        Div => 45,
         Pow => 50,
         _ => todo!(),
     }

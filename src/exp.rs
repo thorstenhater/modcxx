@@ -403,35 +403,37 @@ impl Statement {
     where
         F: FnMut(&Statement) -> Option<Statement>,
     {
-        if let Some(new) = pred(self) {
-            return Ok(new);
-        }
-        match &self.data {
-            StatementT::IfThenElse(c, t, e) => {
-                let mut t = t.clone();
-                for stmnt in t.stmnts.iter_mut() {
-                    *stmnt = stmnt.substitute_if(pred)?;
-                }
-                let e = if let Some(e) = e {
-                    let mut e = e.clone();
-                    for stmnt in e.stmnts.iter_mut() {
+        let res = if let Some(new) = pred(self) {
+            new
+        } else {
+            match &self.data {
+                StatementT::IfThenElse(c, t, e) => {
+                    let mut t = t.clone();
+                    for stmnt in t.stmnts.iter_mut() {
                         *stmnt = stmnt.substitute_if(pred)?;
                     }
-                    Some(e)
-                } else {
-                    None
-                };
-                return Ok(Statement::if_then_else(c.clone(), t, e, self.loc));
-            }
-            StatementT::Block(inner) => {
-                let mut inner = inner.clone();
-                for stmnt in inner.stmnts.iter_mut() {
-                    *stmnt = stmnt.substitute_if(pred)?;
+                    let e = if let Some(e) = e {
+                        let mut e = e.clone();
+                        for stmnt in e.stmnts.iter_mut() {
+                            *stmnt = stmnt.substitute_if(pred)?;
+                        }
+                        Some(e)
+                    } else {
+                        None
+                    };
+                    Statement::if_then_else(c.clone(), t, e, self.loc)
                 }
-                return Ok(Statement::block(inner));
+                StatementT::Block(inner) => {
+                    let mut inner = inner.clone();
+                    for stmnt in inner.stmnts.iter_mut() {
+                        *stmnt = stmnt.substitute_if(pred)?;
+                    }
+                    Statement::block(inner)
+                }
+                _ => self.clone(),
             }
-            _ => return Ok(self.clone()),
-        }
+        };
+        Ok(res)
     }
 }
 
@@ -573,7 +575,70 @@ pub enum StatementT {
 
 pub type Expression = WithLocation<ExpressionT>;
 
+impl ExpressionT {
+    pub fn equivalent(&self, other: &Self) -> bool {
+        use Operator::*;
+        match &self {
+            ExpressionT::Unary(op, rhs) => {
+                if let ExpressionT::Unary(oq, shs) = &other {
+                    oq == op && rhs.equivalent(shs)
+                } else {
+                    false
+                }
+            }
+            ExpressionT::Binary(lhs, op, rhs) => {
+                if let ExpressionT::Binary(mhs, oq, shs) = &other {
+                    if op != oq {
+                        return false;
+                    }
+                    match op {
+                        And | Or | Eq | NEq | Add | Mul => {
+                            (lhs.equivalent(mhs) && rhs.equivalent(shs))
+                                || (lhs.equivalent(shs) && rhs.equivalent(mhs))
+                        }
+                        _ => lhs.equivalent(mhs) && rhs.equivalent(shs),
+                    }
+                } else {
+                    false
+                }
+            }
+            ExpressionT::Variable(v) => {
+                if let ExpressionT::Variable(w) = &other {
+                    v == w
+                } else {
+                    false
+                }
+            }
+            ExpressionT::Number(v) => {
+                if let ExpressionT::Number(w) = &other {
+                    v == w
+                } else {
+                    false
+                }
+            }
+            ExpressionT::String(v) => {
+                if let ExpressionT::String(w) = &other {
+                    v == w
+                } else {
+                    false
+                }
+            }
+            ExpressionT::Call(f, args) => {
+                if let ExpressionT::Call(g, brgs) = &other {
+                    (f == g) && args.iter().zip(brgs.iter()).all(|(a, b)| a.equivalent(b))
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
 impl Expression {
+    pub fn equivalent(&self, other: &Self) -> bool {
+        self.data.equivalent(&other.data)
+    }
+
     pub fn unary(op: Operator, rhs: Expression, loc: Location) -> Self {
         Expression::new(ExpressionT::Unary(op, Box::new(rhs)), loc)
     }
