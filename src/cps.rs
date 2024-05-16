@@ -683,12 +683,12 @@ pub fn substitute(term: Term, lut: &Map<Var, Var>) -> Result<Term> {
         ),
         Term::AppCnt { name, args } => Term::app_cnt(
             &lookup(&name),
-            &args.iter().map(|arg| lookup(arg)).collect::<Vec<_>>(),
+            &args.iter().map(lookup).collect::<Vec<_>>(),
         ),
         Term::AppFun { name, cont, args } => Term::app_fun(
             &lookup(&name),
             &lookup(&cont),
-            &args.iter().map(|arg| lookup(arg)).collect::<Vec<_>>(),
+            &args.iter().map(lookup).collect::<Vec<_>>(),
         ),
         Term::IfElse { cond, then, or } => {
             Term::if_then_else(lookup(&cond), lookup(&then), lookup(&or))
