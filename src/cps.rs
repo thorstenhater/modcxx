@@ -432,7 +432,7 @@ pub fn cps(ml: ML, k: Cont<'_>) -> Term {
                                 &on_false,
                                 &[],
                                 kps(*or, &halt),
-                                Term::if_then_else(&z, &on_true, &on_false),
+                                Term::if_then_else(z, &on_true, &on_false),
                             ),
                         ),
                     )
@@ -458,7 +458,7 @@ pub fn cps(ml: ML, k: Cont<'_>) -> Term {
                             &on_true,
                             &[],
                             kps(*then, &halt),
-                            Term::if_then_else(&z, &on_true, &halt),
+                            Term::if_then_else(z, &on_true, &halt),
                         ),
                     )
                 }),
@@ -487,7 +487,7 @@ pub fn cps(ml: ML, k: Cont<'_>) -> Term {
                     )
                 }
             }
-            cps(*fun, Box::new(|f| make_app(0, &args, Vec::new(), &f, k)))
+            cps(*fun, Box::new(|f| make_app(0, &args, Vec::new(), f, k)))
         }
         ML::Set { .. } => todo!(),
         ML::Seq(_) => todo!(),
@@ -542,7 +542,7 @@ pub fn kps(ml: ML, k: &str) -> Term {
                             &on_false,
                             &[],
                             kps(*or, k),
-                            Term::if_then_else(&z, &on_true, &on_false),
+                            Term::if_then_else(z, &on_true, &on_false),
                         ),
                     )
                 }),
@@ -561,7 +561,7 @@ pub fn kps(ml: ML, k: &str) -> Term {
                         &on_true,
                         &[],
                         kps(*then, k),
-                        Term::if_then_else(&z, &on_true, &k),
+                        Term::if_then_else(z, &on_true, k),
                     )
                 }),
             )
@@ -587,7 +587,7 @@ pub fn kps(ml: ML, k: &str) -> Term {
                     )
                 }
             }
-            cps(*fun, Box::new(|f| make_app(0, &args, Vec::new(), &f, k)))
+            cps(*fun, Box::new(|f| make_app(0, &args, Vec::new(), f, k)))
         }
         ML::Set { .. } => todo!(),
         ML::Seq(_) => todo!(),
@@ -683,17 +683,17 @@ pub fn substitute(term: Term, lut: &Map<Var, Var>) -> Result<Term> {
         ),
         Term::AppCnt { name, args } => Term::app_cnt(
             &lookup(&name),
-            &args.iter().map(|arg| lookup(&arg)).collect::<Vec<_>>(),
+            &args.iter().map(|arg| lookup(arg)).collect::<Vec<_>>(),
         ),
         Term::AppFun { name, cont, args } => Term::app_fun(
             &lookup(&name),
             &lookup(&cont),
-            &args.iter().map(|arg| lookup(&arg)).collect::<Vec<_>>(),
+            &args.iter().map(|arg| lookup(arg)).collect::<Vec<_>>(),
         ),
         Term::IfElse { cond, then, or } => {
             Term::if_then_else(lookup(&cond), lookup(&then), lookup(&or))
         }
-        Term::Return(what) => Term::ret(&lookup(&what)),
+        Term::Return(what) => Term::ret(lookup(&what)),
     };
     Ok(term)
 }
@@ -750,9 +750,9 @@ pub fn constant(term: Term) -> Result<Term> {
                 do_constant(*rest.clone(), lut)?,
             ),
             Term::IfElse { cond, then, or } => match lut.get(cond) {
-                Some(Val::Bool(true)) => Term::app_cnt(&then, &[]),
-                Some(Val::Bool(false)) => Term::app_cnt(&or, &[]),
-                Some(Val::Unit) => Term::app_cnt(&or, &[]),
+                Some(Val::Bool(true)) => Term::app_cnt(then, &[]),
+                Some(Val::Bool(false)) => Term::app_cnt(or, &[]),
+                Some(Val::Unit) => Term::app_cnt(or, &[]),
                 Some(Val::Real(r)) if r.parse::<f64>().unwrap() == 0.0 => Term::app_cnt(or, &[]),
                 Some(Val::Real(_)) => Term::app_cnt(then, &[]),
                 None => term,
@@ -816,7 +816,7 @@ pub fn beta(term: Term) -> Result<Term> {
             Term::AppFun { name, cont, args } => {
                 let (kont, vals, body) = funs
                     .get(name)
-                    .expect(&format!("function {name} not found."));
+                    .unwrap_or_else(|| panic!("function {name} not found."));
                 let mut lut = vals
                     .iter()
                     .map(|v| v.to_string())
@@ -941,7 +941,7 @@ fn to_cxx(term: &Term) -> String {
         continuations: &mut Map<String, (Vec<String>, Term)>,
     ) -> String {
         match term {
-            Term::Var(x) => format!("{x}"),
+            Term::Var(x) => x.to_string(),
             Term::LetVal { name, value, body } => {
                 let body = do_to_cxx(body, ind, continuations);
                 match value {
@@ -979,7 +979,7 @@ fn to_cxx(term: &Term) -> String {
             Term::AppCnt { name, args } => {
                 let (vals, body) = continuations
                     .get(name)
-                    .expect(&format!("continuation {name} not found."));
+                    .unwrap_or_else(|| panic!("continuation {name} not found."));
                 let lut = vals
                     .iter()
                     .cloned()
@@ -992,11 +992,11 @@ fn to_cxx(term: &Term) -> String {
                 let var = gensym();
                 let (vals, body) = continuations
                     .get(cont)
-                    .expect(&format!("continuation {cont} not found."));
+                    .unwrap_or_else(|| panic!("continuation {cont} not found."));
                 let lut = vals
                     .iter()
                     .cloned()
-                    .zip([var.to_string()].into_iter())
+                    .zip([var.to_string()])
                     .collect::<Map<_, _>>();
                 let term = substitute(body.clone(), &lut).unwrap();
                 let rest = do_to_cxx(&term, ind, continuations);
@@ -1007,12 +1007,12 @@ fn to_cxx(term: &Term) -> String {
                 let (vals, then) = continuations
                     .get(then)
                     .as_ref()
-                    .expect(&format!("continuation {then} not found."));
+                    .unwrap_or_else(|| panic!("continuation {then} not found."));
                 assert!(vals.is_empty());
                 let then = do_to_cxx(&then.clone(), ind + 4, continuations);
                 let (vals, or) = continuations
                     .get(or)
-                    .expect(&format!("continuation {or} not found."));
+                    .unwrap_or_else(|| panic!("continuation {or} not found."));
                 assert!(vals.is_empty());
                 let or = do_to_cxx(&or.clone(), ind + 4, continuations);
                 format!(

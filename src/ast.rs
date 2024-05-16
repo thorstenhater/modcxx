@@ -243,10 +243,10 @@ impl Module {
             .initial
             .as_ref()
             .map(|i| i.uses())
-            .unwrap_or(Inventory::new());
+            .unwrap_or_default();
         for state in &self.states {
             let state = &state.name;
-            if initialized.is_written(&state).is_none() {
+            if initialized.is_written(state).is_none() {
                 eprintln!("Warning: STATE variable {state} is not initialized in INITIAL block.");
             }
         }
@@ -255,13 +255,13 @@ impl Module {
             .breakpoint
             .as_ref()
             .map(|i| i.uses())
-            .unwrap_or(Inventory::new());
+            .unwrap_or_default();
         usage.merge(
             &self
                 .net_receive
                 .as_ref()
                 .map(|i| i.uses())
-                .unwrap_or(Inventory::new()),
+                .unwrap_or_default(),
         );
         for blk in &self.kinetics {
             usage.merge(&blk.uses());
@@ -272,7 +272,7 @@ impl Module {
 
         for state in &self.states {
             let state = &state.name;
-            if usage.is_written(&state).is_none()
+            if usage.is_written(state).is_none()
                 && usage.is_written(&format!("{state}'")).is_none()
             {
                 eprintln!("Warning: STATE variable {state} is never updated in any BREAKPOINT/NET_RECEIVE/KINETIC/DERIVATIVE block.");
@@ -282,8 +282,8 @@ impl Module {
         let mut to_remove = Set::new();
         for state in &self.states {
             let state = &state.name;
-            if usage.is_read(&state).is_none() && usage.is_read(&format!("{state}'")).is_none() {
-                if initialized.is_read(&state).is_none() {
+            if usage.is_read(state).is_none() && usage.is_read(&format!("{state}'")).is_none() {
+                if initialized.is_read(state).is_none() {
                     to_remove.insert(state.to_string());
                 } else {
                     eprintln!("Warning: STATE variable {state} is never consumed in any BREAKPOINT/NET_RECEIVE/KINETIC/DERIVATIVE block; however it is used in INITIAL.");
@@ -301,7 +301,7 @@ impl Module {
             for stmnt in blk.stmnts.iter() {
                 match &stmnt.data {
                     StatementT::Assign(lhs, _)
-                        if to_remove.contains(lhs) && !locals.contains(&lhs) => {}
+                        if to_remove.contains(lhs) && !locals.contains(lhs) => {}
                     StatementT::Block(inner) => {
                         let mut inner = inner.clone();
                         strip_writes(&mut inner, to_remove, locals)?;

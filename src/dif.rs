@@ -66,11 +66,7 @@ pub fn derivative(exp: &Expression, var: &str) -> Result<Expression> {
         },
         ExpressionT::Variable(v) => Ok(Expression::float((var == v) as u64, loc)),
         ExpressionT::Number(_) => Ok(Expression::float(0, loc)),
-        ExpressionT::String(_) => Err(InternalError(format!(
-            "Requested derivative of a string, which doesn't exist."
-        ))),
-        ExpressionT::Call(_, _) => Err(InternalError(format!(
-            "Requested derivative of a call, which isn't implemented."
-        ))),
+        ExpressionT::String(_) => Err(InternalError("Requested derivative of a string, which doesn't exist.".to_string())),
+        ExpressionT::Call(_, _) => Err(InternalError("Requested derivative of a call, which isn't implemented.".to_string())),
     }
 }
