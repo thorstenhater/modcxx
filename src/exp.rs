@@ -6,19 +6,19 @@ use std::ops::{Deref, DerefMut};
 
 pub const MAX_PRECISION: u32 = 100;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct WithLocation<T: Clone + PartialEq + Eq + Debug> {
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd)]
+pub struct WithLocation<T: Clone + PartialEq + Eq + Debug + PartialOrd> {
     pub loc: Location,
     pub data: T,
 }
 
-impl<T: Clone + PartialEq + Eq + Debug> WithLocation<T> {
+impl<T: Clone + PartialEq + Eq + Debug + PartialOrd> WithLocation<T> {
     pub fn new(t: T, loc: Location) -> Self {
         WithLocation { loc, data: t }
     }
 }
 
-impl<T: Clone + PartialEq + Eq + Debug> Deref for WithLocation<T> {
+impl<T: Clone + PartialEq + Eq + Debug + PartialOrd> Deref for WithLocation<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -26,21 +26,21 @@ impl<T: Clone + PartialEq + Eq + Debug> Deref for WithLocation<T> {
     }
 }
 
-impl<T: Clone + PartialEq + Eq + Debug> DerefMut for WithLocation<T> {
+impl<T: Clone + PartialEq + Eq + Debug + PartialOrd> DerefMut for WithLocation<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
     }
 }
 
-impl<T: Clone + PartialEq + Eq + Debug> AsRef<T> for WithLocation<T> {
+impl<T: Clone + PartialEq + Eq + Debug + PartialOrd> AsRef<T> for WithLocation<T> {
     fn as_ref(&self) -> &T {
         &self.data
     }
 }
 
+// NOTE since we rely on ordering in this type for precedence, double check this!
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Operator {
-    Nil,
     Not,
     Add,
     Sub,
@@ -59,7 +59,7 @@ pub enum Operator {
     Dt,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd)]
 pub struct Independent {
     pub var: String,
     pub from: String,
@@ -87,7 +87,6 @@ impl fmt::Debug for Operator {
             Operator::Neg => "-",
             Operator::Pow => "^",
             Operator::Dt => "'",
-            _ => unreachable!(),
         };
         write!(f, "{}", op)
     }
@@ -112,7 +111,6 @@ impl fmt::Display for Operator {
             Operator::Neg => "-",
             Operator::Pow => "^",
             Operator::Dt => "'",
-            _ => unreachable!(),
         };
         write!(f, "{}", op)
     }
@@ -120,13 +118,17 @@ impl fmt::Display for Operator {
 
 pub type Block = WithLocation<BlockT>;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd)]
 pub struct BlockT {
     pub locals: Vec<Symbol>,
     pub stmnts: Vec<Statement>,
 }
 
 impl Block {
+    pub fn is_local(&self, nm: &str) -> bool {
+        self.locals.iter().any(|v| v.name == nm)
+    }
+
     pub fn block(locals: &[Symbol], stmnts: &[Statement], loc: Location) -> Self {
         Block {
             data: BlockT {
@@ -145,6 +147,7 @@ impl Block {
             let mut stmnts = Vec::new();
             let mut locals = res.locals.clone();
             for stmnt in &res.stmnts {
+                let stmnt = stmnt.splat_blocks()?;
                 if let StatementT::Block(inner) = &stmnt.data {
                     let mut substs = Map::new();
                     for local in &inner.locals {
@@ -270,6 +273,10 @@ impl Statement {
         Statement::new(StatementT::IfThenElse(i, t, e), loc)
     }
 
+    pub fn if_then(i: Expression, t: Block, loc: Location) -> Self {
+        Statement::new(StatementT::IfThenElse(i, t, None), loc)
+    }
+
     pub fn block(block: Block) -> Self {
         Statement::new(StatementT::Block(block.clone()), block.loc)
     }
@@ -328,18 +335,29 @@ impl Statement {
                 *bwd = bwd.substitute(from, to)?;
             }
             StatementT::Solve(_, _) => {}
+            _ => todo!(),
         }
         Ok(res)
     }
 
     pub fn splat_blocks(&self) -> Result<Self> {
-        if let StatementT::Block(blk) = &self.data {
-            let mut res = self.clone();
-            res.data = StatementT::Block(blk.splat_blocks()?);
-            Ok(res)
-        } else {
-            Ok(self.clone())
+        let mut res = self.clone();
+        match &mut res.data {
+            StatementT::IfThenElse(_, ref mut t, ref mut e) => {
+                *t = t.splat_blocks()?;
+                if let Some(ref mut e) = e {
+                    *e = e.splat_blocks()?;
+                }
+            }
+            StatementT::Block(ref mut inner) => {
+                *inner = inner.splat_blocks()?;
+            }
+            StatementT::Initial(ref mut inner) => {
+                *inner = inner.splat_blocks()?;
+            }
+            _ => {}
         }
+        Ok(res)
     }
 
     pub fn rename_all(&self, lut: &Map<String, String>) -> Result<Self> {
@@ -546,19 +564,20 @@ impl Uses for Statement {
                     .solves
                     .push(entry);
             }
+            _ => todo!(),
         }
         res
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd)]
 pub enum SolveT {
     Default,
     Method(String),
     SteadyState(String),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd)]
 pub enum StatementT {
     Assign(String, Expression),
     Return(Expression),
@@ -571,6 +590,8 @@ pub enum StatementT {
     Solve(String, SolveT),
     Call(String, Vec<Expression>),
     Initial(Block), // This is _only_ ever for NET_RECEIVE... I hate NMODL
+    For(Box<Statement>, Expression, Box<Statement>, Block),
+    While(Expression, Block),
 }
 
 pub type Expression = WithLocation<ExpressionT>;
@@ -586,8 +607,8 @@ impl ExpressionT {
                     false
                 }
             }
-            ExpressionT::Binary(lhs, op, rhs) => {
-                if let ExpressionT::Binary(mhs, oq, shs) = &other {
+            ExpressionT::Binary(op, lhs, rhs) => {
+                if let ExpressionT::Binary(oq, mhs, shs) = &other {
                     if op != oq {
                         return false;
                     }
@@ -644,21 +665,15 @@ impl Expression {
     }
 
     pub fn binary(lhs: Expression, op: Operator, rhs: Expression, loc: Location) -> Self {
-        Expression::new(ExpressionT::Binary(Box::new(lhs), op, Box::new(rhs)), loc)
+        Expression::new(ExpressionT::Binary(op, Box::new(lhs), Box::new(rhs)), loc)
     }
 
     pub fn mul(lhs: Expression, rhs: Expression, loc: Location) -> Self {
-        Expression::new(
-            ExpressionT::Binary(Box::new(lhs), Operator::Mul, Box::new(rhs)),
-            loc,
-        )
+        Self::binary(lhs, Operator::Mul, rhs, loc)
     }
 
     pub fn div(lhs: Expression, rhs: Expression, loc: Location) -> Self {
-        Expression::new(
-            ExpressionT::Binary(Box::new(lhs), Operator::Div, Box::new(rhs)),
-            loc,
-        )
+        Self::binary(lhs, Operator::Div, rhs, loc)
     }
 
     pub fn neg(rhs: Expression, loc: Location) -> Self {
@@ -669,24 +684,15 @@ impl Expression {
         Expression::new(ExpressionT::Unary(Operator::Not, Box::new(rhs)), loc)
     }
     pub fn pow(lhs: Expression, rhs: Expression, loc: Location) -> Self {
-        Expression::new(
-            ExpressionT::Binary(Box::new(lhs), Operator::Pow, Box::new(rhs)),
-            loc,
-        )
+        Self::binary(lhs, Operator::Pow, rhs, loc)
     }
 
     pub fn add(lhs: Expression, rhs: Expression, loc: Location) -> Self {
-        Expression::new(
-            ExpressionT::Binary(Box::new(lhs), Operator::Add, Box::new(rhs)),
-            loc,
-        )
+        Self::binary(lhs, Operator::Add, rhs, loc)
     }
 
     pub fn sub(lhs: Expression, rhs: Expression, loc: Location) -> Self {
-        Expression::new(
-            ExpressionT::Binary(Box::new(lhs), Operator::Sub, Box::new(rhs)),
-            loc,
-        )
+        Self::binary(lhs, Operator::Sub, rhs, loc)
     }
 
     pub fn float<T>(val: T, loc: Location) -> Self
@@ -725,7 +731,7 @@ impl Expression {
             ExpressionT::Unary(_, e) => {
                 res.append(&mut e.variables());
             }
-            ExpressionT::Binary(l, _, r) => {
+            ExpressionT::Binary(_, l, r) => {
                 res.append(&mut l.variables());
                 res.append(&mut r.variables());
             }
@@ -745,7 +751,7 @@ impl Expression {
             ref mut ex if ex == from => {
                 *ex = to.clone();
             }
-            ExpressionT::Binary(ref mut l, _, ref mut r) => {
+            ExpressionT::Binary(_, ref mut l, ref mut r) => {
                 *l = Box::new(l.substitute(from, to)?);
                 *r = Box::new(r.substitute(from, to)?);
             }
@@ -776,7 +782,7 @@ impl Expression {
         } else {
             let mut res = self.clone();
             match res.data {
-                ExpressionT::Binary(ref mut l, _, ref mut r) => {
+                ExpressionT::Binary(_, ref mut l, ref mut r) => {
                     *l = Box::new(l.substitute_if(pred)?);
                     *r = Box::new(r.substitute_if(pred)?);
                 }
@@ -798,7 +804,7 @@ impl Expression {
         use ExpressionT::*;
         let res = match &self.data {
             Unary(op, ex) => Self::unary(*op, ex.rename_all(lut)?, self.loc),
-            Binary(lhs, op, rhs) => {
+            Binary(op, lhs, rhs) => {
                 Self::binary(lhs.rename_all(lut)?, *op, rhs.rename_all(lut)?, self.loc)
             }
             Variable(v) => Self::variable(lut.get(v).unwrap_or(v), self.loc),
@@ -838,7 +844,7 @@ impl Uses for Expression {
                     res.0.entry(k).or_default().merge(&v);
                 }
             }
-            ExpressionT::Binary(l, _, r) => {
+            ExpressionT::Binary(_, l, r) => {
                 for (k, v) in l.uses().into_iter() {
                     res.0.entry(k).or_default().merge(&v);
                 }
@@ -868,23 +874,23 @@ impl Uses for Expression {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd)]
 pub enum ExpressionT {
-    Unary(Operator, Box<Expression>),
-    Binary(Box<Expression>, Operator, Box<Expression>),
-    Variable(String),
     Number(Rational),
     String(String),
+    Variable(String),
+    Unary(Operator, Box<Expression>),
+    Binary(Operator, Box<Expression>, Box<Expression>),
     Call(String, Vec<Expression>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub enum Access {
     RO,
     RW,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd)]
 pub struct VariableT {
     pub name: String,
     pub unit: Option<Unit>,
@@ -989,7 +995,7 @@ pub type Symbol = WithLocation<VariableT>;
 
 pub type Unit = Expression;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd)]
 pub struct CallableT {
     pub name: String,
     pub args: Option<Vec<Symbol>>,
@@ -1215,9 +1221,6 @@ if (v > 0) {
         )
         .statement()
         .unwrap();
-
-        eprintln!("{s:?}");
-
         let res = s.uses();
         assert!(res.is_read("v").is_some());
         assert!(res.is_read("x").is_none());

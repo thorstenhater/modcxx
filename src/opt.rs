@@ -1,6 +1,6 @@
 // Some AST rewriters for algebraic simplification.
 
-use rug::{ops::Pow, Assign, Float, Rational};
+use rug::{ops::Pow, Float, Rational};
 
 use crate::{
     ast::FUNCTIONS,
@@ -9,6 +9,8 @@ use crate::{
         self, Block, BlockT, Callable, Expression, ExpressionT, Operator, Statement, StatementT,
         MAX_PRECISION,
     },
+    usr::Uses,
+    Map,
 };
 
 pub trait Simplify: Sized {
@@ -17,9 +19,15 @@ pub trait Simplify: Sized {
 
 impl Simplify for Expression {
     fn simplify(&self) -> Result<Self> {
-        let mut res = self.clone();
-        res = reduce_algebraic(&res)?;
-        res = factorize(&res)?;
+        let mut res = factorize(&self)?;
+        loop {
+            let new = reduce_algebraic(&res)?;
+            if res.equivalent(&new) {
+                break;
+            }
+            res = new;
+        }
+        // res = collect_terms(&res)?;
         Ok(res)
     }
 }
@@ -34,266 +42,390 @@ impl Simplify for Block {
 
 impl Simplify for BlockT {
     fn simplify(&self) -> Result<Self> {
-        let mut known: Vec<(String, Expression)> = Vec::new();
+        enum VarState {
+            Unknown,
+            Value(Rational),
+            Alias(String),
+        }
+        let mut known: Map<String, Vec<VarState>> = Map::new();
         let mut res = self.clone();
         for stmnt in res.stmnts.iter_mut() {
             *stmnt = stmnt.simplify()?;
             match &mut stmnt.data {
-                StatementT::Assign(lhs, ref mut rhs) => {
-                    if let ExpressionT::Variable(v) = &rhs.data {
-                        if let Some((_, val)) = known.iter().find(|p| &p.0 == v) {
-                            *rhs = val.clone();
+                StatementT::For(i, _, s, b) => {
+                    let bus = b.uses();
+                    let ius = i.uses();
+                    let sus = s.uses();
+                    for (k, vs) in known.iter_mut() {
+                        if bus.is_written(k).is_some()
+                            || sus.is_written(k).is_some()
+                            || ius.is_written(k).is_some()
+                        {
+                            vs.push(VarState::Unknown);
                         }
                     }
-                    known.push((lhs.clone(), rhs.clone()));
+                }
+                StatementT::While(_, b) => {
+                    let bus = b.uses();
+                    for (k, vs) in known.iter_mut() {
+                        if bus.is_written(k).is_some() {
+                            vs.push(VarState::Unknown);
+                        }
+                    }
+                }
+                StatementT::IfThenElse(_, t, e) => {
+                    let tus = t.uses();
+                    let eus = e.as_ref().map(|e| e.uses()).unwrap_or_default();
+                    for (k, vs) in known.iter_mut() {
+                        if eus.is_written(k).is_some() || tus.is_written(k).is_some() {
+                            vs.push(VarState::Unknown);
+                        }
+                    }
+                }
+                StatementT::Assign(lhs, ref mut rhs) => {
+                    *rhs = rhs.substitute_if(&mut |ex| match &ex.data {
+                        ExpressionT::Variable(v) => {
+                            if let Some(x) = known.get(v) {
+                                match x.last() {
+                                    Some(VarState::Alias(y)) => {
+                                        Some(Expression::variable(y, ex.loc))
+                                    }
+                                    Some(VarState::Value(y)) => Some(Expression::float(y, ex.loc)),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })?;
+                    match &rhs.data.clone() {
+                        ExpressionT::Variable(v) => {
+                            let new = if let Some(vs) = known.get(v).as_ref() {
+                                match vs.last() {
+                                    Some(VarState::Alias(x)) => {
+                                        *rhs = Expression::variable(x, stmnt.loc);
+                                        VarState::Alias(x.clone())
+                                    }
+                                    Some(VarState::Value(x)) => {
+                                        *rhs = Expression::float(x, stmnt.loc);
+                                        VarState::Value(x.clone())
+                                    }
+                                    _ => VarState::Alias(v.clone()),
+                                }
+                            } else {
+                                VarState::Alias(v.clone())
+                            };
+                            known.entry(lhs.to_string()).or_default().push(new);
+                        }
+                        ExpressionT::Number(v) => {
+                            known
+                                .entry(lhs.to_string())
+                                .or_default()
+                                .push(VarState::Value(v.clone()));
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
+            // TODO: _do_ something with the known items here.
+            // NOTE: take care with shadowing!
+            // NOTE: is shadowing even allowed?
         }
         Ok(res)
     }
 }
 
+/// Collect terms into powers of a base
+pub(crate) fn collect_terms(expr: &Expression, base: &str) -> Result<(isize, Expression)> {
+    // split off a power of base from expression. return reduced expression and
+    // the exponent of base in the original expression
+    fn go(expr: &Expression, base: &str) -> (isize, Expression) {
+        let loc = expr.loc;
+        match &expr.data {
+            ExpressionT::Variable(v) if v == base => (1, Expression::number("1", expr.loc)),
+            ExpressionT::Unary(op, ex) => match op {
+                Operator::Neg => {
+                    let (e, r) = go(ex, base);
+                    (e, Expression::unary(*op, r, loc))
+                }
+                _ => unreachable!(),
+            },
+            ExpressionT::Binary(op, lhs, rhs) => match op {
+                Operator::Add | Operator::Sub => {
+                    let (el, rl) = go(lhs, base);
+                    let (er, rr) = go(rhs, base);
+                    if el == er {
+                        (el, Expression::binary(rl, *op, rr, loc))
+                    } else if el > er {
+                        let res = Expression::binary(
+                            Expression::mul(
+                                Expression::pow(
+                                    Expression::variable(&base, loc),
+                                    Expression::float(el - er, loc),
+                                    loc,
+                                ),
+                                rl,
+                                loc,
+                            ),
+                            *op,
+                            rr,
+                            loc,
+                        );
+                        (er, res)
+                    } else {
+                        let res = Expression::binary(
+                            rl,
+                            *op,
+                            Expression::mul(
+                                Expression::pow(
+                                    Expression::variable(&base, loc),
+                                    Expression::float(er - el, loc),
+                                    loc,
+                                ),
+                                rr,
+                                loc,
+                            ),
+                            loc,
+                        );
+                        (el, res)
+                    }
+                }
+                Operator::Mul => {
+                    let (el, rl) = go(lhs, base);
+                    let (er, rr) = go(rhs, base);
+                    (el + er, Expression::binary(rl, *op, rr, loc))
+                }
+                Operator::Div => {
+                    let (el, rl) = go(lhs, base);
+                    let (er, rr) = go(rhs, base);
+                    (el - er, Expression::binary(rl, *op, rr, loc))
+                }
+                _ => (0, expr.clone()),
+            },
+            _ => (0, expr.clone()),
+        }
+    }
+    Ok(go(expr, base))
+}
+
 fn reduce_algebraic(exp: &Expression) -> Result<Expression> {
     use ExpressionT::*;
     use Operator::*;
-    let mut res = exp.clone();
+    let res = exp.clone();
     let loc = exp.loc;
     match &res.data {
-        Binary(l, op, r) => {
+        Binary(op, l, r) => {
             let l = reduce_algebraic(l)?;
             let r = reduce_algebraic(r)?;
-            if matches!(l.data, Number(_)) && matches!(r.data, Number(_)) {
-                let ExpressionT::Number(l) = &l.data else {
-                    unreachable!();
-                };
-                let ExpressionT::Number(r) = &r.data else {
-                    unreachable!();
-                };
-                let res = match *op {
-                    Add => l.clone() + r.clone(),
-                    Sub => l.clone() - r.clone(),
-                    Mul => l.clone() * r.clone(),
-                    Div => l.clone() / r.clone(),
-                    Pow => {
-                        let mut lf = Float::new(MAX_PRECISION);
-                        lf.assign(l);
-                        let mut rf = Float::new(MAX_PRECISION);
-                        rf.assign(r);
-                        let res = lf.pow(rf);
-                        res.to_rational().unwrap()
-                    }
-                    LT => Rational::from((l < r) as i64),
-                    GT => Rational::from((l > r) as i64),
-                    LE => Rational::from((l <= r) as i64),
-                    GE => Rational::from((l >= r) as i64),
-                    NEq => Rational::from((l != r) as i64),
-                    Eq => Rational::from((l == r) as i64),
-                    And => Rational::from((l == &0 && r == &0) as i64),
-                    Or => Rational::from((l == &0 || r == &0) as i64),
-                    _ => unreachable!(),
-                };
-                return Ok(Expression::float(res, loc));
-            }
             match op {
                 Mul => {
-                    match &l.data {
+                    match (&l.data, &r.data) {
+                        // Trivial identities
+                        (Number(n), Number(m)) => {
+                            return Ok(Expression::float(n * m, loc));
+                        }
+                        (Number(n), _) if n == &-1 => return Ok(Expression::neg(r, loc)),
+                        (_, Number(n)) if n == &-1 => return Ok(Expression::neg(l, loc)),
+                        (Number(n), _) if n == &1 => {
+                            return Ok(r);
+                        }
+                        (_, Number(n)) if n == &1 => {
+                            return Ok(l);
+                        }
+                        (Number(n), _) if n == &0 => return Ok(Expression::float(0, loc)),
+                        (_, Number(n)) if n == &0 => return Ok(Expression::float(0, loc)),
+                        // Collect into larger fractions
+                        (Binary(Div, n, d), _) => {
+                            let n = reduce_algebraic(&Expression::mul(r, *n.clone(), loc))?;
+                            return Ok(Expression::div(n, *d.clone(), loc));
+                        }
+                        (_, Binary(Div, n, d)) => {
+                            let n = reduce_algebraic(&Expression::mul(l, *n.clone(), loc))?;
+                            return Ok(Expression::div(n, *d.clone(), loc));
+                        }
+                        (x, Binary(Pow, y, n)) if x.equivalent(y) => {
+                            return Ok(Expression::pow(
+                                l,
+                                Expression::add(*n.clone(), Expression::float(1, loc), loc),
+                                loc,
+                            ))
+                        }
                         // Float out negation
-                        ExpressionT::Unary(Neg, l) => {
-                            return Ok(Expression::neg(Expression::mul(*l.clone(), r, loc), loc))
+                        (Unary(Neg, x), _) => {
+                            return Ok(Expression::neg(Expression::mul(*x.clone(), r, loc), loc))
                         }
-                        // Evaluate trivial cases
-                        Number(n) => {
-                            if n == &0 {
-                                return Ok(Expression::number("0", loc));
-                            }
-                            if n == &1 {
-                                return Ok(r);
-                            }
-                        }
-                        Binary(n, Div, d) => {
-                            let n = reduce_algebraic(n)?;
-                            let d = reduce_algebraic(d)?;
-                            return Ok(Expression::div(Expression::mul(n, r, loc), d, loc));
-                        }
-                        // Swaps power to the right, but never swap powers
-                        // TODO come up with a concept for ordering powers.
-                        Binary(_, Pow, _) if !matches!(&l.data, Binary(_, Pow, _)) => {
-                            return Ok(Expression::binary(r, *op, l, loc))
-                        }
-                        // combine powers of the same base
-                        Binary(x, Pow, m) if matches!(&r.data, Binary(y, Pow, _) if x == y) => {
-                            if let Binary(y, Pow, n) = &r.data {
-                                return Ok(Expression::binary(
-                                    *y.clone(),
-                                    Pow,
-                                    Expression::add(*m.clone(), *n.clone(), loc),
-                                    loc,
-                                ));
-                            } else {
-                                unreachable!()
-                            }
-                        }
-                        // combine a * a ^ n => a ^ n+1
-                        x if matches!(&r.data, Binary(y, Pow, _) if x == &y.data) => {
-                            if let Binary(y, Pow, e) = &r.data {
-                                return Ok(Expression::binary(
-                                    *y.clone(),
-                                    Pow,
-                                    Expression::add(*e.clone(), Expression::number("1", loc), loc),
-                                    loc,
-                                ));
-                            } else {
-                                unreachable!()
-                            }
+                        (_, Unary(Neg, r)) => {
+                            return Ok(Expression::neg(Expression::mul(l, *r.clone(), loc), loc))
                         }
                         _ => {}
                     }
-                    match &r.data {
-                        // Float out negation
-                        ExpressionT::Unary(Neg, r) => {
-                            let r = reduce_algebraic(r)?;
-                            return Ok(Expression::neg(Expression::mul(l, r, loc), loc));
-                        }
-                        Binary(n, Div, d) => {
-                            let n = reduce_algebraic(n)?;
-                            let d = reduce_algebraic(d)?;
-                            return Ok(Expression::div(Expression::mul(l, n, loc), d, loc));
-                        }
-                        // Evaluate trivial cases
-                        Number(n) => {
-                            if n == &0 {
-                                return Ok(Expression::number("0", loc));
-                            }
-                            if n == &1 {
-                                return Ok(l);
-                            }
-                        }
-                        _ => {}
+                    if r < l {
+                        return Ok(Expression::mul(r, l, loc));
+                    } else {
+                        return Ok(Expression::mul(l, r, loc));
                     }
-                    return Ok(Expression::binary(l, *op, r, loc));
                 }
                 Div => {
-                    // inverse
-                    if l.equivalent(&r) {
-                        return Ok(Expression::number("1", loc));
-                    }
-                    match &l.data {
-                        Number(n) if n == &0 => return Ok(Expression::number("0", loc)),
-                        ExpressionT::Unary(Neg, l) => {
+                    match (&l.data, &r.data) {
+                        (x, y) if x.equivalent(y) => return Ok(Expression::float(1, loc)),
+                        (Number(n), Number(m)) => return Ok(Expression::float(n / m, loc)),
+                        (Number(n), _) if n == &0 => return Ok(Expression::float(0, loc)),
+                        (_, Number(n)) if n == &0 => {
+                            return Err(ModcxxError::InternalError("Division by zero".to_string()))
+                        }
+                        (_, Number(n)) if n == &1 => return Ok(l),
+                        (_, Number(n)) if n == &-1 => return Ok(Expression::neg(l, loc)),
+                        (_, Number(n)) => {
+                            return Ok(Expression::mul(Expression::float(1 / n, loc), l, loc))
+                        }
+                        (Unary(Neg, l), _) => {
                             return Ok(Expression::neg(Expression::div(*l.clone(), r, loc), loc))
                         }
-                        // (a/b)/r => a/ (b r)
-                        ExpressionT::Binary(a, Div, b) => {
-                            return Ok(Expression::div(
-                                *a.clone(),
-                                Expression::mul(*b.clone(), r, l.loc),
-                                loc,
-                            ))
-                        }
-                        _ => {}
-                    }
-                    match &r.data {
-                        Number(n) if n == &1 => return Ok(l),
-                        Number(n) => {
-                            return Ok(Expression::mul(
-                                Expression::float(Rational::from(1) / n, r.loc),
-                                l,
-                                loc,
-                            ));
-                        }
-                        // l/(a/b) => l b / a
-                        ExpressionT::Binary(a, Div, b) => {
-                            return Ok(Expression::div(
-                                Expression::mul(*b.clone(), l.clone(), l.loc),
-                                *a.clone(),
-                                loc,
-                            ))
-                        }
-                        ExpressionT::Unary(Neg, r) => {
+                        (_, Unary(Neg, r)) => {
                             return Ok(Expression::neg(Expression::div(l, *r.clone(), loc), loc))
                         }
+                        // (a/b)/r => a/ (b r)
+                        (Binary(Div, n, d), _) => {
+                            return Ok(Expression::div(
+                                *n.clone(),
+                                Expression::mul(*d.clone(), r, l.loc),
+                                loc,
+                            ))
+                        }
+                        // l/(a/b) => l b / a
+                        (_, Binary(Div, n, d)) => {
+                            return Ok(Expression::div(
+                                Expression::mul(l, *d.clone(), loc),
+                                *n.clone(),
+                                loc,
+                            ))
+                        }
                         _ => {}
                     }
-                    return Ok(Expression::binary(l, *op, r, loc));
                 }
                 Add => {
-                    if matches!(&l.data, Number(n) if n == &0) {
-                        return Ok(r);
-                    } else if matches!(&r.data, Number(n) if n == &0) {
-                        return Ok(l);
-                    } else if matches!(&r.data, Unary(Neg, _)) {
-                        if let Unary(Neg, n) = r.data {
-                            res = Expression::binary(l, Sub, *n, loc);
-                        } else {
-                            unreachable!()
+                    if r < l {
+                        return Ok(Expression::add(r, l, loc));
+                    }
+                    match (&l.data, &r.data) {
+                        (Number(n), Number(m)) => return Ok(Expression::float(n + m, loc)),
+                        (Number(n), _) if n == &0 => return Ok(r),
+                        (_, Number(n)) if n == &0 => return Ok(l),
+                        (Unary(Neg, l), Unary(Neg, r)) => {
+                            return Ok(Expression::neg(
+                                Expression::add(*l.clone(), *r.clone(), loc),
+                                loc,
+                            ))
                         }
-                    } else {
-                        res = Expression::binary(l, *op, r, loc);
-                    }
-                }
-                Sub => {
-                    if l == r {
-                        return Ok(Expression::number("0", loc));
-                    }
-                    if matches!(&l.data, Number(n) if n == &0) {
-                        res = Expression::neg(r, loc);
-                    } else if matches!(&r.data, Number(n) if n == &0) {
-                        res = l;
-                    } else if matches!(&r.data, ExpressionT::Unary(Neg, _)) {
-                        if let ExpressionT::Unary(Neg, x) = r.data {
-                            res = Expression::binary(l, Add, *x, loc);
-                        } else {
-                            unreachable!()
+                        (Unary(Neg, l), _) => {
+                            return Ok(Expression::sub(r.clone(), *l.clone(), loc))
                         }
-                    } else {
-                        res = Expression::binary(l, *op, r, loc);
-                    }
-                }
-                Pow => {
-                    match &l.data {
-                        Number(n) => {
-                            if n == &1 {
-                                return Ok(Expression::number("1", loc));
-                            } else if n == &0 {
-                                return Ok(Expression::number("0", loc));
-                            }
+                        (_, Unary(Neg, r)) => {
+                            return Ok(Expression::sub(l.clone(), *r.clone(), loc))
                         }
                         _ => {}
                     }
-                    match &r.data {
-                        Number(n) => {
-                            if n == &1 {
-                                return Ok(l);
-                            } else if n == &0 {
-                                return Ok(Expression::number("1", loc));
-                            } else {
-                                return Ok(Expression::binary(l, *op, r, loc));
-                            }
-                        }
-                        _ => {}
+                    if r < l {
+                        return Ok(Expression::add(r, l, loc));
+                    } else {
+                        return Ok(Expression::add(l, r, loc));
                     }
-                    return Ok(Expression::binary(l, *op, r, loc));
                 }
-                _ => {
-                    return Ok(Expression::binary(l, *op, r, loc));
+                Sub => match (&l.data, &r.data) {
+                    (x, y) if x.equivalent(y) => return Ok(Expression::float(0, loc)),
+                    (Number(n), Number(m)) => return Ok(Expression::float(n - m, loc)),
+                    (Number(n), _) if n == &0 => return Ok(Expression::neg(r, loc)),
+                    (_, Number(n)) if n == &0 => return Ok(l),
+                    (Unary(Neg, l), Unary(Neg, r)) => {
+                        return Ok(Expression::sub(*r.clone(), *l.clone(), loc))
+                    }
+                    (Unary(Neg, l), _) => {
+                        return Ok(Expression::neg(
+                            Expression::add(*l.clone(), r.clone(), loc),
+                            loc,
+                        ))
+                    }
+                    (_, Unary(Neg, r)) => return Ok(Expression::add(l.clone(), *r.clone(), loc)),
+                    _ => {}
+                },
+                Pow => match (&l.data, &r.data) {
+                    (Number(n), Number(m)) => {
+                        let lf = Float::with_val(MAX_PRECISION, n);
+                        let rf = Float::with_val(MAX_PRECISION, m);
+                        return Ok(Expression::float(lf.pow(rf).to_rational().unwrap(), loc));
+                    }
+                    (Number(n), _) if n == &0 => return Ok(Expression::float(0, loc)),
+                    (Number(n), _) if n == &1 => return Ok(Expression::float(1, loc)),
+                    (_, Number(n)) if n == &0 => return Ok(Expression::float(1, loc)),
+                    (_, Number(n)) if n == &1 => return Ok(l.clone()),
+                    _ => {}
+                },
+                LT => {
+                    if let (Number(n), Number(m)) = (&l.data, &r.data) {
+                        return Ok(Expression::float((n < m) as i64, loc));
+                    }
                 }
+                GT => {
+                    if let (Number(n), Number(m)) = (&l.data, &r.data) {
+                        return Ok(Expression::float((n > m) as i64, loc));
+                    }
+                }
+                GE | LE | Eq if l.equivalent(&r) => return Ok(Expression::float(1, loc)),
+                NEq if l.equivalent(&r) => return Ok(Expression::float(0, loc)),
+                GE => {
+                    if let (Number(n), Number(m)) = (&l.data, &r.data) {
+                        return Ok(Expression::float((n >= m) as i64, loc));
+                    }
+                }
+                LE => {
+                    if let (Number(n), Number(m)) = (&l.data, &r.data) {
+                        return Ok(Expression::float((n <= m) as i64, loc));
+                    }
+                }
+                And => match (&l.data, &r.data) {
+                    (Number(n), Number(m)) => {
+                        return Ok(Expression::float((n != &0 && m != &0) as i64, loc))
+                    }
+                    (Number(n), _) if n == &0 => return Ok(Expression::float(0, loc)),
+                    (_, Number(n)) if n == &0 => return Ok(Expression::float(0, loc)),
+                    (Number(n), _) if n == &1 => return Ok(r),
+                    (_, Number(n)) if n == &1 => return Ok(l),
+                    (a, b) if a.equivalent(b) => return Ok(l),
+                    _ => {}
+                },
+                Or => match (&l.data, &r.data) {
+                    (Number(n), _) if n == &1 => return Ok(Expression::float(1, loc)),
+                    (_, Number(n)) if n == &1 => return Ok(Expression::float(1, loc)),
+                    (Number(n), _) if n == &0 => return Ok(r),
+                    (_, Number(n)) if n == &0 => return Ok(l),
+                    (a, b) if a.equivalent(b) => return Ok(l),
+                    _ => {}
+                },
+                _ => {}
             }
+            return Ok(Expression::binary(l, *op, r, loc));
         }
-        Unary(op, x) => {
-            let x = reduce_algebraic(x)?;
+        Unary(op, y) => {
+            let x = reduce_algebraic(y)?;
             match op {
                 Neg => match &x.data {
-                    ExpressionT::Binary(l, Sub, r) => {
-                        return Ok(Expression::binary(*r.clone(), Sub, *l.clone(), x.loc))
+                    ExpressionT::Binary(Sub, l, r) => {
+                        return Ok(Expression::sub(*r.clone(), *l.clone(), x.loc))
                     }
                     ExpressionT::Unary(Neg, r) => return Ok(*r.clone()),
                     ExpressionT::Number(v) => return Ok(Expression::float(-v, loc)),
                     _ => {}
                 },
+                Not => match &x.data {
+                    ExpressionT::Number(v) if v == &0 => return Ok(Expression::float(1, loc)),
+                    ExpressionT::Number(_) => return Ok(Expression::float(0, loc)),
+                    _ => {}
+                },
                 _ => {}
             }
-            return Ok(Expression::neg(x, loc));
+            return Ok(Expression::unary(*op, x, loc));
         }
         Call(f, args) => {
             let args = args
@@ -366,7 +498,6 @@ fn reduce_algebraic(exp: &Expression) -> Result<Expression> {
                                 loc,
                             ));
                         }
-
                         _ => unreachable!(""),
                     }
                 }
@@ -379,27 +510,27 @@ fn reduce_algebraic(exp: &Expression) -> Result<Expression> {
 }
 
 /// helper to tack a series of multiplications onto an expression
-fn add_factors(exp: &Expression, cfs: &[ExpressionT]) -> Expression {
-    let mut exp = exp.clone();
+fn add_factors(exp: &Expression, cfs: &[ExpressionT]) -> Result<Expression> {
+    let mut exp = reduce_algebraic(exp)?;
     let loc = exp.loc;
     for cf in cfs {
         let cf = Expression {
             data: cf.clone(),
             loc,
         };
-        let cf = reduce_algebraic(&cf).unwrap();
+        let cf = reduce_algebraic(&cf)?;
 
         if let ExpressionT::Number(v) = &cf.data {
             if v == &0 {
-                return Expression::float(0, loc);
+                return Ok(Expression::float(0, loc));
             }
             if v == &1 {
                 continue;
             }
         }
-        exp = Expression::mul(cf, exp, loc);
+        exp = reduce_algebraic(&Expression::mul(cf.clone(), exp, loc))?;
     }
-    reduce_algebraic(&exp).unwrap()
+    reduce_algebraic(&exp)
 }
 
 /// recursively factorize expression and return a list of common factors and the
@@ -413,7 +544,7 @@ fn factorize(exp: &Expression) -> Result<Expression> {
                 let (cfs, rhs) = go(rhs)?;
                 Ok((cfs, Expression::unary(*op, rhs, loc)))
             }
-            ExpressionT::Binary(lhs, op, rhs) => {
+            ExpressionT::Binary(op, lhs, rhs) => {
                 let (mut rfs, mut rhs) = go(rhs)?;
                 let (mut lfs, mut lhs) = go(lhs)?;
                 match op {
@@ -421,9 +552,9 @@ fn factorize(exp: &Expression) -> Result<Expression> {
                     Pow => Ok((
                         vec![
                             Expression::binary(
-                                add_factors(&lhs, &lfs),
+                                add_factors(&lhs, &lfs)?,
                                 *op,
-                                add_factors(&rhs, &rfs),
+                                add_factors(&rhs, &rfs)?,
                                 loc,
                             )
                             .data,
@@ -442,9 +573,9 @@ fn factorize(exp: &Expression) -> Result<Expression> {
                             }
                         }
                         lfs.retain(|x| !cfs.contains(x));
-                        lhs = add_factors(&lhs, &lfs);
+                        lhs = add_factors(&lhs, &lfs)?;
                         rfs.retain(|x| !cfs.contains(x));
-                        rhs = add_factors(&rhs, &rfs);
+                        rhs = add_factors(&rhs, &rfs)?;
                         Ok((cfs, Expression::binary(lhs, *op, rhs, loc)))
                     }
                     // Multiplication
@@ -471,17 +602,16 @@ fn factorize(exp: &Expression) -> Result<Expression> {
                                 cfs.push(l.clone());
                             }
                         }
-                        eprintln!("Div {cfs:?} <- {lfs:?} - {rfs:?}");
                         rfs.retain(|x| !cfs.contains(x) && !lfs.contains(x));
-                        rhs = add_factors(&rhs, &rfs);
+                        rhs = add_factors(&rhs, &rfs)?;
                         Ok((cfs, Expression::binary(lhs, *op, rhs, loc)))
                     }
                     LT | GT | GE | LE | Eq | NEq | And | Or => Ok((
                         Vec::new(),
                         Expression::binary(
-                            add_factors(&lhs, &lfs),
+                            add_factors(&lhs, &lfs)?,
                             *op,
-                            add_factors(&rhs, &rfs),
+                            add_factors(&rhs, &rfs)?,
                             loc,
                         ),
                     )),
@@ -498,7 +628,7 @@ fn factorize(exp: &Expression) -> Result<Expression> {
         }
     }
     let (cfs, exp) = go(exp)?;
-    let exp = add_factors(&exp, &cfs);
+    let exp = add_factors(&exp, &cfs)?;
     Ok(exp)
 }
 
@@ -536,6 +666,16 @@ impl Simplify for Statement {
                 }
             }
             Solve(_, _) => {}
+            For(i, c, s, b) => {
+                *i = Box::new(i.simplify()?);
+                *c = c.simplify()?;
+                *s = Box::new(s.simplify()?);
+                *b = b.simplify()?;
+            }
+            While(c, b) => {
+                *c = c.simplify()?;
+                *b = b.simplify()?;
+            }
         }
         Ok(res)
     }
@@ -553,6 +693,7 @@ impl Simplify for Callable {
 mod tests {
     use super::*;
 
+    use crate::exp::Rational;
     use crate::loc::Location;
 
     #[test]
@@ -775,6 +916,27 @@ mod tests {
     }
 
     #[test]
+    /// Test that neutral elements do not matter after reduction
+    fn test_squeeze_ones() {
+        use crate::par::Parser;
+        let red =
+            Parser::new_from_str("---(1 * (2 - 1) * 1 * 1 * (alpha + beta + 0)) / (alpha / 1)")
+                .expression()
+                .unwrap();
+        let red = reduce_algebraic(&red).unwrap();
+        let exp = Parser::new_from_str("-(alpha + beta) / alpha")
+            .expression()
+            .unwrap();
+        let exp = reduce_algebraic(&exp).unwrap();
+        assert!(exp.equivalent(&red));
+        let red = Parser::new_from_str("1 * 1").expression().unwrap();
+        let red = red.simplify().unwrap();
+        let exp = Parser::new_from_str("1").expression().unwrap();
+        let exp = reduce_algebraic(&exp).unwrap();
+        assert!(exp.equivalent(&red));
+    }
+
+    #[test]
     fn test_factorize() {
         fn test(exp: &str, ok: &Expression) {
             use crate::par::Parser;
@@ -819,5 +981,21 @@ mod tests {
             ),
         );
         test("(a * x + x * b) / (b + a)", &Expression::variable("x", loc));
+    }
+
+    #[test]
+    fn test_collect() {
+        fn test(inp: &str, (pow, out): (isize, &str), base: &str) {
+            let inp = crate::par::Parser::new_from_str(inp).expression().unwrap();
+            let (exp, inp) = collect_terms(&inp, base).unwrap();
+            let inp = inp.simplify().unwrap();
+            let out = crate::par::Parser::new_from_str(out).expression().unwrap();
+            assert_eq!(exp, pow);
+            assert!(out.equivalent(&inp));
+        }
+        test("x * x", (2, "1"), "x");
+        test("x * y + z * x", (1, "y + z"), "x");
+        test("x * x * y + z * x", (1, "x * y + z"), "x");
+        test("(x + z)/(x * x)", (-2, "x + z"), "x");
     }
 }

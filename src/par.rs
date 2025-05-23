@@ -1021,13 +1021,29 @@ pub fn parse(input: &str) -> Result<Module> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::loc::Location;
     use pretty_assertions::assert_eq;
 
     #[test]
     fn fabs() {
-        println!(
-            "{:?}",
-            Parser::new_from_str("fabs(x)").expression().unwrap()
+        assert_eq!(
+            Parser::new_from_str("fabs(x)").expression().unwrap(),
+            Expression::call(
+                "fabs",
+                vec![Expression::variable(
+                    "x",
+                    Location {
+                        line: 0,
+                        column: 5,
+                        position: 5
+                    }
+                )],
+                Location {
+                    line: 0,
+                    column: 0,
+                    position: 0
+                }
+            )
         );
 
         println!(
@@ -1035,13 +1051,83 @@ mod test {
             Parser::new_from_str("fabs(-x)^2").expression().unwrap()
         );
 
-        println!(
-            "{:?}",
-            Parser::new_from_str("if (fabs(x / y) < 1e-6) {}")
-                .statement()
-                .unwrap()
+        assert_eq!(
+            Parser::new_from_str("fabs(-x)^2").expression().unwrap(),
+            Expression::pow(
+                Expression::call(
+                    "fabs",
+                    vec![Expression::neg(
+                        Expression::variable(
+                            "x",
+                            Location {
+                                line: 0,
+                                column: 6,
+                                position: 6
+                            }
+                        ),
+                        Location {
+                            line: 0,
+                            column: 5,
+                            position: 5
+                        },
+                    )],
+                    Location {
+                        line: 0,
+                        column: 0,
+                        position: 0
+                    }
+                ),
+                Expression::float(
+                    2,
+                    Location {
+                        line: 0,
+                        column: 9,
+                        position: 9
+                    }
+                ),
+                Location {
+                    line: 0,
+                    column: 8,
+                    position: 8
+                }
+            )
         );
+
+        // println!(
+        // "{:?}",
+        // Parser::new_from_str(
+        // .statement()
+        // .unwrap()
+        // ));
+
+        assert_eq!(
+            Parser::new_from_str("fabs(x)").expression().unwrap(),
+            Expression::call(
+                "fabs",
+                vec![Expression::variable(
+                    "x",
+                    Location {
+                        line: 0,
+                        column: 5,
+                        position: 5
+                    }
+                )],
+                Location {
+                    line: 0,
+                    column: 0,
+                    position: 0
+                },
+            )
+        );
+
+        // assert_eq!(Parser::new_from_str("if (fabs(x / y) < 1e-6) {}").statement().unwrap(),
+        // Statement::if_then(Expression::call("fabs",
+        // vec![Expression::variable("x", Location { line: 0, column: 5, position: 5 })],
+        // Location { line: 0, column: 0, position: 0 }),
+
+        // ));
     }
+
     #[test]
     fn nrn1() {
         fn check(m: &str, line: usize, column: usize, position: usize) {
@@ -1360,6 +1446,19 @@ BREAKPOINT {
                 ),
                 Expression::number("3", Location::new(0, 4, 4)),
                 Location::new(0, 3, 3)
+            )
+        );
+
+        let exp = Parser::new_from_str("-X^2").expression().unwrap();
+        assert_eq!(
+            exp,
+            Expression::neg(
+                Expression::pow(
+                    Expression::variable("X", Location::new(0, 1, 1)),
+                    Expression::number("2", Location::new(0, 3, 3)),
+                    Location::new(0, 2, 2)
+                ),
+                Location::new(0, 0, 0)
             )
         );
 

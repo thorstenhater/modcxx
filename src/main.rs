@@ -29,8 +29,10 @@ fn simplify_module(module: &modcxx::ast::Module) -> Result<modcxx::ast::Module> 
     let mut new = module
         .clone()
         .inline_procedures()?
-        .inline_functions()?
+        // .inline_functions()?
         .kinetic_to_sparse()?
+        .simplify()?
+        // .collect_ode_systems()?
         .simplify()?
         .solve_odes()?
         .simplify()?;
@@ -49,7 +51,6 @@ fn simplify_module(module: &modcxx::ast::Module) -> Result<modcxx::ast::Module> 
             break;
         }
         new = nxt;
-        // break;
     }
     // final clean up
     let new = new.eliminate_dead_locals()?;

@@ -6,9 +6,9 @@ edition = "2021"
 [dependencies]
 clap          = { version = ">=4", features = ["derive"] }
 thiserror     = { version = ">=1" }
+gmp-mpfr-sys  = { version = ">=1", features = ["c-no-tests"] }
 rug           = { version = ">=1.2" }
-egg           = { version = ">=0.9", features = ["lp"] }
-ordered-float = { version = ">=4.2" }
+
 [dev-dependencies]
 pretty_assertions = { version = ">=1.4" }
 

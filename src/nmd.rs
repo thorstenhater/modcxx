@@ -145,7 +145,7 @@ fn units(raw: &Units) -> Result<String> {
                 names.push((nm.to_string(), unit(&desc.data)?));
                 len = std::cmp::max(len, nm.len());
             }
-            ExpressionT::Binary(lhs, Operator::Sub, rhs) => {
+            ExpressionT::Binary(Operator::Sub, lhs, rhs) => {
                 let nm = format!("{}-{}", unit(&lhs.data)?, unit(&rhs.data)?);
                 len = std::cmp::max(len, nm.len());
                 names.push((nm, unit(&desc.data)?));
@@ -178,7 +178,7 @@ fn unit(ex: &ExpressionT) -> Result<String> {
             ExpressionT::Number(var) => {
                 res.push_str(&var.to_string());
             }
-            ExpressionT::Binary(lhs, op, rhs) => {
+            ExpressionT::Binary(op, lhs, rhs) => {
                 unit_(&lhs.data, res)?;
                 res.push_str(&format!("{op}"));
                 unit_(&rhs.data, res)?;
@@ -258,7 +258,6 @@ fn assigned(assign: &[Symbol]) -> Result<String> {
 fn precedence_of(out: Operator) -> usize {
     use Operator::*;
     match out {
-        Nil => 0,
         And | Or => 10,
         Not | LT | GT | GE | LE | Eq | NEq => 20,
         Add | Sub => 30,
@@ -270,18 +269,18 @@ fn precedence_of(out: Operator) -> usize {
 }
 
 pub fn expression(ex: &Expression) -> Result<String> {
-    expression_with_precedence(ex, Operator::Nil)
+    expression_with_precedence(ex, Operator::And)
 }
 
 fn expression_with_precedence(ex: &Expression, out: Operator) -> Result<String> {
     let res = match &ex.data {
         ExpressionT::Variable(v) => v.to_string(),
-        ExpressionT::Binary(l, o, r) if precedence_of(*o) < precedence_of(out) => format!(
+        ExpressionT::Binary(o, l, r) if precedence_of(*o) < precedence_of(out) => format!(
             "({} {o} {})",
             expression_with_precedence(l, *o)?,
             expression_with_precedence(r, *o)?
         ),
-        ExpressionT::Binary(l, o, r) => format!(
+        ExpressionT::Binary(o, l, r) => format!(
             "{} {o} {}",
             expression_with_precedence(l, *o)?,
             expression_with_precedence(r, *o)?
@@ -300,7 +299,7 @@ fn expression_with_precedence(ex: &Expression, out: Operator) -> Result<String> 
     Ok(res)
 }
 
-fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String> {
+pub fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String> {
     let mut res = Vec::new();
     match &stmnt.data {
         StatementT::Solve(it, how) => {
@@ -392,7 +391,28 @@ fn statement(stmnt: &Statement, ind: usize, func: Option<&str>) -> Result<String
                 expression(r)?
             ));
         }
-        StatementT::Initial(_) => unreachable!(), // This must be removed/rewritten before!
+        // This must be removed/rewritten before!
+        StatementT::Initial(_) => unreachable!(),
+        StatementT::For(i, c, s, b) => {
+            let mut b = b.clone();
+            b.stmnts.push(*s.clone());
+            res.push(format!(
+                "{}
+{:ind$}WHILE ({}) {}",
+                expression(c)?,
+                "",
+                statement(i, ind, func)?,
+                block(&b, ind, func)?.trim_start()
+            ));
+        }
+        StatementT::While(c, b) => {
+            res.push(format!(
+                "{:ind$}WHILE ({}) {}",
+                "",
+                expression(c)?,
+                block(b, ind, func)?.trim_start()
+            ));
+        }
     }
     Ok(res.join("\n"))
 }
@@ -478,9 +498,11 @@ fn function(proc: &Callable) -> Result<String> {
 pub fn block(block: &Block, ind: usize, func: Option<&str>) -> Result<String> {
     let mut res = Vec::new();
     res.push(format!("{:ind$}{{", ""));
+    let iind = ind + 2;
     if !block.locals.is_empty() {
         res.push(format!(
-            "  LOCAL {}",
+            "{:iind$}LOCAL {}",
+            "",
             block
                 .locals
                 .iter()
@@ -491,7 +513,7 @@ pub fn block(block: &Block, ind: usize, func: Option<&str>) -> Result<String> {
         res.push(String::new());
     }
     for stmnt in &block.stmnts {
-        res.push(statement(stmnt, ind + 2, func)?);
+        res.push(statement(stmnt, iind, func)?);
     }
     res.push(format!("{:ind$}}}", ""));
     Ok(res.join("\n"))

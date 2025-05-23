@@ -14,7 +14,7 @@ pub fn derivative(exp: &Expression, var: &str) -> Result<Expression> {
             let rhs = derivative(rhs, var)?.simplify()?;
             Ok(Expression::unary(*op, rhs, loc))
         }
-        ExpressionT::Binary(ls, op, rs) => match op {
+        ExpressionT::Binary(op, ls, rs) => match op {
             Operator::Add | Operator::Sub => Expression::binary(
                 derivative(ls, var)?.simplify()?,
                 *op,
@@ -66,7 +66,11 @@ pub fn derivative(exp: &Expression, var: &str) -> Result<Expression> {
         },
         ExpressionT::Variable(v) => Ok(Expression::float((var == v) as u64, loc)),
         ExpressionT::Number(_) => Ok(Expression::float(0, loc)),
-        ExpressionT::String(_) => Err(InternalError("Requested derivative of a string, which doesn't exist.".to_string())),
-        ExpressionT::Call(_, _) => Err(InternalError("Requested derivative of a call, which isn't implemented.".to_string())),
+        ExpressionT::String(_) => Err(InternalError(
+            "Requested derivative of a string, which doesn't exist.".to_string(),
+        )),
+        ExpressionT::Call(_, _) => Err(InternalError(
+            "Requested derivative of a call, which isn't implemented.".to_string(),
+        )),
     }
 }
